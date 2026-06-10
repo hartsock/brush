@@ -1,0 +1,59 @@
+# brush-py/Cargo.toml
+#
+# Phase 1 (fork prototype): a STANDALONE PyO3 cdylib crate that makes ZERO changes
+# to any existing brush crate. It depends on the PUBLISHED crates.io releases of
+# brush-core (0.5) and brush-builtins (0.2), so it is immune to in-tree API churn
+# (issues #972 / #454) as long as versions are pinned and only the exported facade
+# is used.
+#
+# Deliberately NOT added to the parent brush workspace and NOT inheriting
+# [workspace.lints] / [profile.release] from the root. The empty `[workspace]`
+# table below makes brush-py its OWN independent workspace root, so cargo does not
+# try to treat it as a member of the parent brush workspace (whose explicit
+# `members` list does not include brush-py). Build it with maturin pointing at
+# this manifest. When upstreaming (Phase 2), switch the two brush deps to
+# `{ version = "...", path = "../brush-core" }` like brush-interactive does, add it
+# to the root [workspace] members, and add a panic="unwind" profile + a local lint
+# table.
+
+# Independent workspace root: isolates brush-py from the parent brush workspace.
+# REQUIRED -- without it, cargo errors because the parent root Cargo.toml does not
+# list brush-py in its [workspace] members.
+[workspace]
+
+[package]
+name = "brush-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the brush shell (PyO3 over brush-core)"
+license = "MIT"
+repository = "https://github.com/reubeno/brush"
+publish = false           # shipped to PyPI via maturin, not to crates.io
+
+[lib]
+name = "brush"            # produces the Python module `brush`
+crate-type = ["cdylib"]   # extension module; abi3 is only honored for cdylib (not bin)
+bench = false
+
+[dependencies]
+# abi3-py39 => one wheel per platform, runs on CPython 3.9+.
+# extension-module => do not link libpython (correct for an importable .so/.pyd).
+pyo3 = { version = "0.24", features = ["abi3-py39", "extension-module"] }
+
+# brush-core's execution API is fully async; we own a multi-thread runtime and
+# block_on each call (mirrors brush-core/examples/call-func.rs). brush-core on
+# unix already requires rt-multi-thread/process/signal, so this matches.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Capture stdout/stderr via tempfiles (std::fs::File -> OpenFile::File(Arc)).
+# Tempfiles avoid the ~64KB OS-pipe-buffer DEADLOCK that a naive PipeWriter capture
+# hits, because brush-core's concurrent pipe drainer (AsyncPipeReader) is pub(crate)
+# and NOT reachable from an out-of-tree crate.
+tempfile = "3"
+
+# Reusable core of the shell (PUBLISHED). Pin tight: pre-1.0, minor bumps can break.
+brush-core = "0.5"
+
+# Builtins live in a SEPARATE crate. A bare Shell::builder().build() has NO
+# echo/cd/export/printf; we MUST feed default_builtins(BashMode) or scripts misbehave.
+brush-builtins = "0.2"
