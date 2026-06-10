@@ -17,6 +17,7 @@ its own independent cargo workspace, so it is insulated from in-tree API churn.
 - stdout/stderr captured via tempfiles (no 64 KB OS-pipe deadlock), so even
   large output and external commands are captured cleanly.
 - `bash`-mode builtins enabled by default (`echo`, `cd`, `export`, `printf`, ...).
+- Bundled type stubs (`py.typed`) for editor autocomplete and `mypy`/`pyright`.
 
 ## Build & install (development)
 
@@ -67,6 +68,10 @@ print(sh.cwd())                          # '/tmp'
 # Combine stderr into stdout (like 2>&1).
 r = sh.run("echo out; echo err >&2", combine_stderr=True)
 
+# Define a function, then invoke it directly by name.
+sh.run('shout() { echo "$1" | tr a-z A-Z; }')
+print(sh.call_function("shout", ["loud"]).stdout.strip())  # 'LOUD'
+
 # Run a script file with positional args.
 res = sh.run_script("/path/to/script.sh", ["arg1", "arg2"])
 ```
@@ -78,7 +83,9 @@ res = sh.run_script("/path/to/script.sh", ["arg1", "arg2"])
 | Method | Description |
 | --- | --- |
 | `run(command, combine_stderr=False) -> CompletedCommand` | Run a command string (REPL-style; no exit handlers). |
+| `run_c(command, combine_stderr=False) -> CompletedCommand` | Run with `bash -c` semantics (runs EXIT traps afterward). |
 | `run_script(path, args=[]) -> CompletedCommand` | Run a script file with positional args (runs exit handlers). |
+| `call_function(name, args=[], combine_stderr=False) -> CompletedCommand` | Invoke a defined shell function by name (raises if undefined). |
 | `setenv(name, value, export=True)` | Set a shell variable, exported by default. |
 | `getenv(name) -> Optional[str]` | Read a variable, or `None` if unset. |
 | `cd(path)` | Change the working directory. |
@@ -88,8 +95,13 @@ res = sh.run_script("/path/to/script.sh", ["arg1", "arg2"])
 `CompletedCommand` carries `.stdout`, `.stderr`, `.exit_code`, `.success`, and
 supports `bool(...)` (true iff exit code 0).
 
-Parse/syntax errors raise a Python exception; other non-zero exits are reported
-via `CompletedCommand.exit_code`.
+**Error contract:** syntax/parse errors are reported bash-style — `exit_code == 2`
+with the parser message on `.stderr` (they do **not** raise). A `RuntimeError` is
+raised only for lower-level execution failures. Check `.success` / `.exit_code`.
+
+The package ships [PEP 561](https://peps.python.org/pep-0561/) type stubs
+(`brush/__init__.pyi` + `py.typed`), so editors and `mypy`/`pyright` get full
+autocomplete and type checking for the API.
 
 ## License
 

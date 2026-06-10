@@ -31,7 +31,10 @@ repository = "https://github.com/reubeno/brush"
 publish = false           # shipped to PyPI via maturin, not to crates.io
 
 [lib]
-name = "brush"            # produces the Python module `brush`
+# Compiled extension is `_brush`; the pure-Python package `brush` (python/brush/)
+# re-exports it and carries the type stubs. This "mixed" layout is what lets us ship
+# a .pyi + py.typed for editor autocomplete. `import brush` still works for users.
+name = "_brush"
 crate-type = ["cdylib"]   # extension module; abi3 is only honored for cdylib (not bin)
 bench = false
 

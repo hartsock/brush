@@ -54,7 +54,14 @@ def main() -> None:
     big = sh.run("for i in $(seq 1 50000); do echo line $i; done")
     print("big lines:", big.stdout.count("\n"))        # 50000
 
-    # 8) Run a script file (uncomment with a real path):
+    # 8) Define a function, then invoke it directly by name.
+    sh.run('shout() { echo "$1" | tr a-z A-Z; }')
+    print("call_function:", sh.call_function("shout", ["loud"]).stdout.strip())  # LOUD
+
+    # 9) `bash -c` semantics (runs EXIT traps afterward).
+    print("run_c:", sh.run_c("echo via dash-c").stdout.strip())                  # via dash-c
+
+    # 10) Run a script file (uncomment with a real path):
     # res = sh.run_script("/path/to/script.sh", ["arg1", "arg2"])
     # print("script exit:", res.exit_code)
 

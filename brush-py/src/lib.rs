@@ -16,9 +16,12 @@
 //!    concurrent drainer (`AsyncPipeReader`) is `pub(crate)` and unreachable out-of-tree.
 //!    `TryFrom<OpenFile> for Stdio` `try_clone`s the File so EXTERNAL commands are
 //!    captured too (VERIFIED openfiles.rs:242).
-//!  * Parse errors map to a Rust `Err` from `run_string` (run_parsed_result maps
-//!    ParseError -> Err); we surface that as a Python exception. Non-parse failures
-//!    return `Ok` with a nonzero exit code, which we surface on `CompletedCommand`.
+//!  * Syntax/parse errors are reported bash-style (VERIFIED empirically against
+//!    brush-core 0.5.0): `run_string` returns `Ok` with `exit_code == 2` and the
+//!    parser message on stderr -- it does NOT raise. A Python exception is raised only
+//!    when brush-core returns a Rust `Err` (lower-level execution/IO failures). So
+//!    callers should check `.exit_code` / `.success`, not rely on exceptions for bad
+//!    syntax.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
@@ -197,7 +200,8 @@ impl PyShell {
         Ok(CompletedCommand {
             stdout,
             stderr,
-            // Non-parse failures are non-fatal at the Result level; the truth is in exit_code.
+            // Failures (incl. syntax errors -> exit 2, message on stderr) surface via
+            // exit_code, not exceptions; the truth is always in exit_code.
             exit_code: u8::from(result.exit_code),
         })
     }
@@ -266,15 +270,110 @@ impl PyShell {
         self.shell.working_dir().display().to_string()
     }
 
+    /// Run a command with `bash -c` semantics: execute the string, then run shell-exit
+    /// handling (EXIT traps, etc.). One-shot style; for repeated REPL-style use on the
+    /// same instance prefer `run()`. Process-safe: `run_dash_c_command` returns a result
+    /// rather than terminating the process (execution.rs:184).
+    #[pyo3(signature = (command, combine_stderr = false))]
+    fn run_c(
+        &mut self,
+        py: Python<'_>,
+        command: &str,
+        combine_stderr: bool,
+    ) -> PyResult<CompletedCommand> {
+        let out_file = capture_tempfile()?;
+        let err_file = capture_tempfile()?;
+        let out_for_fd = out_file.try_clone().map_err(to_pyerr)?;
+        let err_for_fd = if combine_stderr {
+            out_file.try_clone().map_err(to_pyerr)?
+        } else {
+            err_file.try_clone().map_err(to_pyerr)?
+        };
+        let command = command.to_owned();
+
+        let result = py
+            .allow_threads(|| {
+                // run_dash_c_command computes its own params internally, so install the
+                // capture fds on the shell's persistent table (inherited by default_exec_params).
+                self.shell
+                    .open_files_mut()
+                    .set_fd(OpenFiles::STDOUT_FD, OpenFile::from(out_for_fd));
+                self.shell
+                    .open_files_mut()
+                    .set_fd(OpenFiles::STDERR_FD, OpenFile::from(err_for_fd));
+                self.rt.block_on(self.shell.run_dash_c_command(command))
+            })
+            .map_err(to_pyerr)?;
+
+        let stdout = read_capture(out_file)?;
+        let stderr = if combine_stderr {
+            String::new()
+        } else {
+            read_capture(err_file)?
+        };
+        Ok(CompletedCommand {
+            stdout,
+            stderr,
+            exit_code: u8::from(result.exit_code),
+        })
+    }
+
+    /// Invoke a shell function defined in this shell by name, passing string args.
+    /// Returns a `CompletedCommand` with captured output and the function's exit status.
+    /// Raises if no function with that name is defined (`invoke_function` funcs.rs:93,
+    /// which takes execution params, so we capture via `params.set_fd`).
+    #[pyo3(signature = (name, args = None, combine_stderr = false))]
+    fn call_function(
+        &mut self,
+        py: Python<'_>,
+        name: &str,
+        args: Option<Vec<String>>,
+        combine_stderr: bool,
+    ) -> PyResult<CompletedCommand> {
+        let out_file = capture_tempfile()?;
+        let err_file = capture_tempfile()?;
+        let out_for_fd = out_file.try_clone().map_err(to_pyerr)?;
+        let err_for_fd = if combine_stderr {
+            out_file.try_clone().map_err(to_pyerr)?
+        } else {
+            err_file.try_clone().map_err(to_pyerr)?
+        };
+        let name = name.to_owned();
+        let args = args.unwrap_or_default();
+
+        let exit_code = py
+            .allow_threads(|| {
+                let mut params = self.shell.default_exec_params();
+                params.set_fd(OpenFiles::STDOUT_FD, OpenFile::from(out_for_fd));
+                params.set_fd(OpenFiles::STDERR_FD, OpenFile::from(err_for_fd));
+                self.rt
+                    .block_on(self.shell.invoke_function(name, args, &params))
+            })
+            .map_err(to_pyerr)?;
+
+        let stdout = read_capture(out_file)?;
+        let stderr = if combine_stderr {
+            String::new()
+        } else {
+            read_capture(err_file)?
+        };
+        Ok(CompletedCommand {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
     /// The last exit status recorded by the shell.
     fn last_exit_status(&self) -> u8 {
         self.shell.last_exit_status()
     }
 }
 
-/// The `brush` Python module.
+/// The compiled `brush._brush` extension module. The pure-Python `brush` package
+/// (python/brush/__init__.py) re-exports `Shell` and `CompletedCommand` from here.
 #[pymodule]
-fn brush(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _brush(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShell>()?;
     m.add_class::<CompletedCommand>()?;
     Ok(())

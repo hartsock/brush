@@ -1,0 +1,13 @@
+# Rust build output
+/target
+
+# Python build / test / packaging artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+dist/
+*.whl
