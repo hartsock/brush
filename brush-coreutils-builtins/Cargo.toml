@@ -1,5 +1,5 @@
 [package]
-name = "brush-coreutils-builtins"
+name = "brush-ocap-coreutils-builtins"
 description = "Optional coreutils builtins for brush-shell (powered by uutils/coreutils)"
 version = "0.1.0"
 categories.workspace = true
@@ -7,10 +7,11 @@ edition.workspace = true
 keywords.workspace = true
 license.workspace = true
 readme.workspace = true
-repository.workspace = true
+repository = "https://github.com/hartsock/brush"
 rust-version.workspace = true
 
 [lib]
+name = "brush_coreutils_builtins"
 bench = false
 
 [features]

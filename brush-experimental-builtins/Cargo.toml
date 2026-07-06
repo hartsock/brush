@@ -15,12 +15,12 @@ bench = false
 
 [features]
 default = ['builtin.save']
-'builtin.save' = ["brush-core/serde", "dep:serde_json"]
+'builtin.save' = ["brush-ocap-core/serde", "dep:serde_json"]
 
 [lints]
 workspace = true
 
 [dependencies]
-brush-core = { version = "^0.5.0", path = "../brush-core" }
+brush-ocap-core = { version = "^0.5.0", path = "../brush-core" }
 clap = { version = "4.6.0", features = ["derive", "wrap_help"] }
 serde_json = { version = "1.0.149", optional = true }

@@ -24,7 +24,7 @@ assert_cmd = "2.2.0"
 libfuzzer-sys = "0.4"
 tokio = { version = "1.52.3", features = ["rt"] }
 
-[dependencies.brush-core]
+[dependencies.brush-ocap-core]
 path = "../brush-core"
 
 [dependencies.brush-parser]

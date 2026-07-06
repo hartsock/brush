@@ -62,12 +62,12 @@ experimental = [
 ]
 experimental-builtins = ["dep:brush-experimental-builtins"]
 experimental-bundled-coreutils = [
-    "dep:brush-coreutils-builtins",
-    "brush-coreutils-builtins/coreutils.all",
+    "dep:brush-ocap-coreutils-builtins",
+    "brush-ocap-coreutils-builtins/coreutils.all",
 ]
-experimental-load = ["dep:serde_json", "brush-core/serde"]
+experimental-load = ["dep:serde_json", "brush-ocap-core/serde"]
 experimental-parser = [
-    "brush-core/experimental-parser",
+    "brush-ocap-core/experimental-parser",
     "brush-parser/winnow-parser",
 ]
 schema = ["dep:schemars"]
@@ -76,9 +76,9 @@ schema = ["dep:schemars"]
 workspace = true
 
 [dependencies]
-brush-core = { version = "^0.5.0", path = "../brush-core" }
-brush-builtins = { version = "^0.2.0", path = "../brush-builtins" }
-brush-coreutils-builtins = { version = "^0.1.0", path = "../brush-coreutils-builtins", optional = true }
+brush-ocap-core = { version = "^0.5.0", path = "../brush-core" }
+brush-ocap-builtins = { version = "^0.2.0", path = "../brush-builtins" }
+brush-ocap-coreutils-builtins = { version = "^0.1.0", path = "../brush-coreutils-builtins", optional = true }
 brush-experimental-builtins = { version = "^0.1.0", path = "../brush-experimental-builtins", optional = true }
 clap = { version = "4.6.0", features = ["derive", "env"] }
 color-print = "0.3.7"

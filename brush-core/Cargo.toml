@@ -1,5 +1,5 @@
 [package]
-name = "brush-core"
+name = "brush-ocap-core"
 description = "Reusable core of a POSIX/bash shell (used by brush-shell)"
 version = "0.5.0"
 categories.workspace = true
@@ -7,10 +7,11 @@ edition.workspace = true
 keywords.workspace = true
 license.workspace = true
 readme.workspace = true
-repository.workspace = true
+repository = "https://github.com/hartsock/brush"
 rust-version.workspace = true
 
 [lib]
+name = "brush_core"
 bench = false
 
 [lints]
@@ -87,8 +88,10 @@ uuid = { version = "1.23.1", features = ["js"] }
 anyhow = "1.0.102"
 # Used only by integration tests that need a realistically-populated builtin
 # table (e.g. `echo`, `.`/`source`) to exercise the capability-interceptor
-# hooks. This is a dev-dependency cycle (brush-builtins depends on brush-core),
-# which Cargo permits for dev-dependencies.
-brush-builtins = { version = "^0.2.0", path = "../brush-builtins" }
+# hooks. This is a dev-dependency cycle (brush-ocap-builtins depends on brush-ocap-core).
+# PATH-ONLY (no version) on purpose: cargo drops a path-only dev-dependency from
+# the published manifest, which breaks the publish cycle so brush-ocap-core can be
+# the first crate published (brush-ocap-builtins then depends on the published core).
+brush-ocap-builtins = { path = "../brush-builtins" }
 pretty_assertions = { version = "1.4.1", features = ["unstable"] }
 tempfile = "3.27.0"
