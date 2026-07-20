@@ -356,6 +356,35 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         reason = "these unwrap calls should not panic"
     )]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
+        // Give the configured command interceptor (capability confinement) a
+        // chance to deny this command before we dispatch it. This function is
+        // the single funnel through which *every* command passes — builtin,
+        // shell function, and external alike — so the hook fires exactly once
+        // per invocation, including on each iteration of a loop. That is what
+        // lets a host observe (and stop) a loop built purely out of builtins,
+        // which never reaches the external-spawn site that `before_exec`
+        // guards.
+        //
+        // The default interceptor's hook is an inlineable no-op, so this costs
+        // nothing for shells that do not install one; `command_name` is passed
+        // as a borrow so that no allocation occurs per command.
+        {
+            use crate::extensions::CommandInterceptor as _;
+            if let extensions::CommandDecision::Deny(reason) = self
+                .shell
+                .command_interceptor()
+                .before_command(self.command_name.as_str())
+            {
+                // Mirror the command-not-found path's cleanup so the ephemeral
+                // per-command environment scope is not leaked.
+                if let Some(post_execute) = self.post_execute {
+                    let _ = post_execute(&mut self.shell);
+                }
+
+                return Err(error::ErrorKind::CommandDenied(self.command_name, reason).into());
+            }
+        }
+
         // First see if it's the name of a builtin.
         let builtin = self.shell.builtins().get(&self.command_name).cloned();
 

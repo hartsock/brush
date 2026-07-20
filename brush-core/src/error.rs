@@ -324,6 +324,16 @@ pub enum ErrorKind {
     /// program; the second is the reason supplied by the interceptor.
     #[error("{0}: execution denied: {1}")]
     ExecDenied(String, String),
+
+    /// Dispatch of a command was denied by the configured command
+    /// interceptor's per-command hook. The first field is the command name; the
+    /// second is the reason supplied by the interceptor.
+    ///
+    /// This error is *terminating* (see [`Error::is_terminating`]): the
+    /// interpreter propagates it out of the run rather than converting it into
+    /// an exit status, so that an enclosing loop cannot continue past it.
+    #[error("{0}: command denied: {1}")]
+    CommandDenied(String, String),
 }
 
 /// Trait implementable by built-in commands to represent errors.
@@ -369,7 +379,7 @@ impl From<&ErrorKind> for results::ExecutionExitCode {
             ErrorKind::FunctionParseError(..) => Self::InvalidUsage,
             ErrorKind::TestCommandParseError(..) => Self::InvalidUsage,
             ErrorKind::FailedToExecuteCommand(..) => Self::CannotExecute,
-            ErrorKind::ExecDenied(..) => Self::CannotExecute,
+            ErrorKind::ExecDenied(..) | ErrorKind::CommandDenied(..) => Self::CannotExecute,
             ErrorKind::FunctionNameShadowsSpecialBuiltin { .. } => Self::InvalidUsage,
             ErrorKind::IoError(io_err) => io_err.into(),
             ErrorKind::BuiltinError(inner, ..) => inner.as_exit_code(),
@@ -417,6 +427,29 @@ impl Error {
     /// Returns whether or not this error is fatal.
     pub const fn is_fatal(&self) -> bool {
         self.fatal
+    }
+
+    /// Returns whether this error must terminate the entire run.
+    ///
+    /// The interpreter normally *recovers* from an error raised by a single
+    /// command: it prints the error, converts it into an exit status via
+    /// [`Self::into_result`], and carries on with the next command. That is
+    /// correct for ordinary failures, but it means an enclosing `while`/`until`
+    /// loop simply spins on the failure forever.
+    ///
+    /// A terminating error opts out of that recovery at every such site, so it
+    /// propagates out of the interpreter to the caller of
+    /// [`Shell::run_string`](crate::Shell::run_string) (and friends) as a real
+    /// `Err`. It is reserved for conditions under which continuing to execute
+    /// would be wrong — currently, a denial from
+    /// [`CommandInterceptor::before_command`](crate::extensions::CommandInterceptor::before_command),
+    /// which an embedding host uses to stop a runaway script.
+    ///
+    /// Note that this is stronger than [`Self::is_fatal`]: a fatal error only
+    /// exits a *non-interactive* shell, and does so by way of an exit status
+    /// rather than by propagating an error.
+    pub const fn is_terminating(&self) -> bool {
+        matches!(self.kind, ErrorKind::CommandDenied(..))
     }
 
     /// Returns a reference to the error kind.

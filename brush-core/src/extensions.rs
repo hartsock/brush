@@ -73,6 +73,21 @@ pub enum ExecDecision {
     Deny(String),
 }
 
+/// Decision returned by [`CommandInterceptor::before_command`] to control
+/// whether command execution may proceed at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandDecision {
+    /// Allow the command to be dispatched (the default).
+    Allow,
+    /// Deny the command. The contained string explains why.
+    ///
+    /// Unlike [`ExecDecision::Deny`], this decision **terminates the whole
+    /// run**: the interpreter propagates it out rather than converting it into
+    /// a per-command exit status, so an enclosing loop cannot continue past it.
+    /// See [`CommandInterceptor::before_command`] for the rationale.
+    Deny(String),
+}
+
 /// Decision returned by [`CommandInterceptor::before_open`] to control whether
 /// a file may be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +117,48 @@ pub enum OpenDecision {
 /// at *every* external-spawn site — including that path-separator branch — so a
 /// policy here cannot be circumvented by spelling the command differently.
 pub trait CommandInterceptor: Clone + Default + Send + Sync + 'static {
+    /// Called immediately before *every* command is dispatched — builtins,
+    /// shell functions, and external programs alike — exactly once per
+    /// invocation, and therefore once per iteration for a command inside a
+    /// `while`/`until`/`for` loop.
+    ///
+    /// # Why this exists in addition to [`before_exec`](Self::before_exec)
+    ///
+    /// [`before_exec`](Self::before_exec) only fires for external spawns, so a
+    /// loop built entirely out of builtins (`while true; do :; done`) never
+    /// consults the interceptor at all. A host that needs to *bound* a run —
+    /// for example, to cancel a runaway script or enforce a deadline — has no
+    /// observation point in that loop and cannot stop it.
+    ///
+    /// Returning [`CommandDecision::Deny`] therefore does more than fail the
+    /// command: it aborts the entire run, propagating out of the interpreter as
+    /// an error instead of being converted into an exit status. A per-command
+    /// failure would be swallowed by the enclosing loop and the runaway would
+    /// continue.
+    ///
+    /// # Performance
+    ///
+    /// This is a hot path — it runs once per command, which can mean many
+    /// thousands of calls per second inside a tight loop. The default
+    /// implementation is a no-op that returns [`CommandDecision::Allow`]; since
+    /// the interceptor is a statically dispatched associated type, it compiles
+    /// away entirely for shells that do not install one. Implementations should
+    /// keep the body cheap (an atomic load and compare is a reasonable budget)
+    /// and must not allocate; `name` is borrowed precisely so that no `String`
+    /// need be constructed per call.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the command as written by the user, before any
+    ///   `PATH` resolution. This is the builtin/function name for those cases,
+    ///   and the literal word (e.g. `rm`, `/bin/rm`, `./script`) for externals.
+    ///   For a resolved external program path, use
+    ///   [`before_exec`](Self::before_exec) instead.
+    fn before_command(&self, name: &str) -> CommandDecision {
+        let _ = name;
+        CommandDecision::Allow
+    }
+
     /// Called immediately before an external command is spawned, at every spawn
     /// site (including the path-separator branch that bypasses `PATH` and the
     /// builtin table). Returning [`ExecDecision::Deny`] prevents the command

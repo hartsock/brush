@@ -216,6 +216,8 @@ impl Execute for ast::Program {
             // errors.
             match command.execute(shell, params).await {
                 Ok(exec_result) => result = exec_result,
+                // A terminating error opts out of this recovery; propagate it.
+                Err(err) if err.is_terminating() => return Err(err),
                 Err(err) => {
                     // Display the error and convert to an execution result.
                     let _ = shell.display_error(&mut params.stderr(shell), &err);
@@ -690,6 +692,9 @@ impl Execute for ast::CompoundCommand {
                 // from propagating to the parent shell.
                 let subshell_result = match list.execute(&mut subshell, params).await {
                     Ok(result) => result,
+                    // A terminating error escapes even the subshell boundary:
+                    // the whole run is being stopped, not just this subshell.
+                    Err(error) if error.is_terminating() => return Err(error),
                     Err(error) => {
                         // Display the error to stderr, but prevent fatal error propagation
                         let mut stderr = params.stderr(shell);
@@ -1303,6 +1308,10 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 
             match execute_command(context, params, cmd_name, &assignments, &args).await {
                 Ok(result) => Ok(result),
+                // A terminating error must not be turned into a per-command
+                // exit status here: doing so is exactly what lets an enclosing
+                // loop spin on it forever. Propagate it out of the run instead.
+                Err(err) if err.is_terminating() => Err(err),
                 Err(err) => {
                     let _ = parent_shell.display_error(&mut stderr, &err);
 

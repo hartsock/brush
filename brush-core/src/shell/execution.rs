@@ -250,6 +250,9 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         // Report any errors.
         match result {
             Ok(result) => Ok(result),
+            // A terminating error is surfaced to our caller as a real `Err`
+            // rather than being reported and folded into an exit status.
+            Err(err) if err.is_terminating() => Err(err),
             Err(err) => {
                 let _ = self.display_error(&mut params.stderr(self), &err);
 
