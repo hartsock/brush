@@ -1,0 +1,91 @@
+# .github/workflows/wheels.yml
+# Build + publish multi-platform abi3 wheels for brush-py to PyPI.
+#
+# Bootstrap tip: `maturin generate-ci github` produces a similar matrix.
+# abi3 (abi3-py39) collapses the Python axis to ONE wheel per platform.
+#
+# PIPELINE PARITY: this workflow ships the Python artifact; the existing Rust
+# binary release lives in cd.yaml. Keep triggers/conventions aligned when editing.
+
+name: wheels
+
+on:
+  push:
+    tags:
+      - "brush-py-v*"
+  pull_request:        # dry-run builds (no publish) to catch breakage early
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.platform.target }} on ${{ matrix.platform.runner }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  manylinux: "2014" }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-gnu, manylinux: "2014" }
+          - { runner: macos-13,       target: x86_64-apple-darwin }
+          - { runner: macos-14,       target: aarch64-apple-darwin }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # host Python must be >= the abi3 floor (3.9)
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: brush-py
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux || 'auto' }}
+          args: --release --out dist
+          sccache: "true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.target }}
+          path: brush-py/dist/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: brush-py
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: brush-py/dist/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/brush-py-v')
+    environment: release
+    permissions:
+      id-token: write   # PyPI Trusted Publishing (OIDC); no long-lived token needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        with:
+          command: upload
+          args: --non-interactive --skip-existing dist/*

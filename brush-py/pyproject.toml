@@ -1,0 +1,42 @@
+# brush-py/pyproject.toml
+# maturin build backend with abi3 (single wheel per platform, CPython 3.9+).
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+# PyPI distribution name. Checked 2026-06-10: 'brush' is TAKEN, 'brush-shell' is
+# AVAILABLE (fallbacks if it changes: 'brushsh', 'brush-py'). The IMPORT name is
+# `brush` regardless (the python/brush/ package re-exports the `_brush` extension).
+name = "brush-shell"
+description = "Embeddable POSIX/bash shell - Python bindings for brush (PyO3 over brush-core)"
+requires-python = ">=3.9"   # must match the abi3 floor (abi3-py39)
+license = { text = "MIT" }
+readme = "README.md"
+dynamic = ["version"]        # version comes from Cargo.toml
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Shells",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Repository = "https://github.com/reubeno/brush"
+
+[tool.maturin]
+# Path is relative to this file. This pyproject sits inside brush-py/ next to its
+# own Cargo.toml.
+manifest-path = "Cargo.toml"
+# Force the abi3 feature at build time (belt-and-suspenders with Cargo.toml features).
+features = ["pyo3/abi3-py39"]
+# Mixed Rust/Python layout: the compiled extension is `brush._brush`; the hand-written
+# package under python/brush/ (__init__.py + __init__.pyi + py.typed) re-exports it and
+# provides type stubs. Users still `import brush`.
+python-source = "python"
+module-name = "brush._brush"
+
+[tool.maturin.generate-ci.github]
+trusted-publishing = true
+publishing-environment = "release"
