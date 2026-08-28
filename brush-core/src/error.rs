@@ -18,6 +18,35 @@ pub struct Error {
     fatal: bool,
 }
 
+/// Payload attached to the [`std::io::Error`] of an
+/// [`ErrorKind::FailedToExecuteCommand`] when an installed
+/// [`crate::extensions::CommandInterceptor`] denied the execution.
+///
+/// The `io::Error` has kind [`std::io::ErrorKind::PermissionDenied`]; a host that wants the
+/// interceptor's own reason can recover this type with
+/// [`std::io::Error::get_ref`] and `downcast_ref`.
+#[derive(Debug, thiserror::Error)]
+#[error("execution denied by policy: {reason}")]
+pub struct ExecDeniedError {
+    reason: String,
+}
+
+impl ExecDeniedError {
+    /// Creates a denial payload carrying `reason`.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// The reason the interceptor gave.
+    #[must_use]
+    pub const fn reason(&self) -> &str {
+        self.reason.as_str()
+    }
+}
+
 /// Monolithic error type for the shell
 #[derive(thiserror::Error, Debug)]
 pub enum ErrorKind {

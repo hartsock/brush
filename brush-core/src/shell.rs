@@ -61,6 +61,11 @@ pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExten
     #[cfg_attr(feature = "serde", serde(skip, default = "default_error_formatter"))]
     error_formatter: SE::ErrorFormatter,
 
+    /// How this shell is confined. Serializes as a single bool; see
+    /// [`extensions::InterceptorSlot`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    command_interceptor: extensions::InterceptorSlot,
+
     /// Trap handler configuration for the shell.
     traps: crate::traps::TrapHandlerConfig,
 
@@ -151,6 +156,7 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
         Self {
             error_formatter: self.error_formatter.clone(),
+            command_interceptor: self.command_interceptor.clone(),
             traps: self.traps.clone(),
             open_files: self.open_files.clone(),
             working_dir: self.working_dir.clone(),
@@ -214,6 +220,11 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         // Instantiate the shell with some defaults.
         let mut shell = Self {
             error_formatter: options.error_formatter,
+            command_interceptor: options
+                .command_interceptor
+                .map_or(extensions::InterceptorSlot::Unconfined, |interceptor| {
+                    extensions::InterceptorSlot::Installed(interceptor)
+                }),
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
@@ -350,6 +361,30 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
 
     pub(crate) const fn last_exit_status_change_count(&self) -> usize {
         self.last_exit_status_change_count
+    }
+
+    /// Returns how this shell is confined. The shell consults the slot automatically before
+    /// every execution; hosts rarely need to read it directly.
+    #[must_use]
+    pub const fn command_interceptor(&self) -> &extensions::InterceptorSlot {
+        &self.command_interceptor
+    }
+
+    /// Installs `interceptor`, or removes any installed policy when given `None`.
+    ///
+    /// This is how a shell deserialized in the
+    /// [`AwaitingReinstall`](extensions::InterceptorSlot::AwaitingReinstall) state is made
+    /// executable again. Passing `None` to such a shell deliberately unconfines it: that is
+    /// an explicit act by the host, not the silent default a plain `Option` field would
+    /// have produced.
+    pub fn set_command_interceptor(
+        &mut self,
+        interceptor: Option<std::sync::Arc<dyn extensions::CommandInterceptor>>,
+    ) {
+        self.command_interceptor = interceptor
+            .map_or(extensions::InterceptorSlot::Unconfined, |interceptor| {
+                extensions::InterceptorSlot::Installed(interceptor)
+            });
     }
 }
 
