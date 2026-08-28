@@ -177,11 +177,16 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// # Arguments
     ///
     /// * `options` - The options to use opening the file.
+    /// * `access` - The access the caller is requesting. This is the *declared*
+    ///   intent, stated by the caller from the syntax that requested the open;
+    ///   it is what the configured command interceptor is shown. It must agree
+    ///   with `options`.
     /// * `path` - The path to the file to open; may be relative to the shell's working directory.
     /// * `params` - Execution parameters.
     pub(crate) fn open_file(
         &self,
         options: &std::fs::OpenOptions,
+        access: crate::extensions::OpenAccess,
         path: impl AsRef<Path>,
         params: &ExecutionParameters,
     ) -> Result<openfiles::OpenFile, std::io::Error> {
@@ -194,6 +199,23 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         }
 
         let path_to_open = self.absolute_path(path.as_ref());
+
+        // Consult the configured command interceptor (capability confinement)
+        // before opening. This is the single choke point through which all
+        // filesystem-path opens flow (redirections and `source`/`.`), so a
+        // policy applied here covers every path-based open in the shell.
+        {
+            use crate::extensions::CommandInterceptor as _;
+            let request = crate::extensions::OpenRequest::new(&path_to_open, access);
+            if let crate::extensions::OpenDecision::Deny(reason) =
+                self.command_interceptor().before_open(&request)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("open denied: {reason}"),
+                ));
+            }
+        }
 
         // See if this is a reference to a file descriptor. These paths should
         // reflect the shell's current execution fds, which can differ from the
