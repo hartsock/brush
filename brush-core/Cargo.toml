@@ -85,5 +85,8 @@ uuid = { version = "1.23.1", features = ["js"] }
 
 [dev-dependencies]
 anyhow = "1.0.102"
+# Integration tests only: the open hook is reached through `echo`/`source`, which need a
+# real builtin table. Cargo permits this dev-dependency cycle.
+brush-builtins = { version = "^0.2.0", path = "../brush-builtins" }
 pretty_assertions = { version = "1.4.1", features = ["unstable"] }
 tempfile = "3.27.0"
