@@ -157,6 +157,69 @@ impl<SE: extensions::ShellExtensions> std::ops::DerefMut for ShellForCommand<'_,
     }
 }
 
+/// Resolves `command_name` to the executable brush would actually run.
+///
+/// Mirrors external command dispatch: a name containing a path separator is taken as
+/// written, anything else is looked up in `PATH` (using the shell's hash cache).
+///
+/// Returns `None` when a bare name is not found in `PATH`.
+pub fn resolve_external_program<SE: extensions::ShellExtensions>(
+    shell: &mut Shell<SE>,
+    command_name: &str,
+) -> Option<PathBuf> {
+    if sys::fs::contains_path_separator(command_name) {
+        Some(PathBuf::from(command_name))
+    } else {
+        shell.find_first_executable_in_path_using_cache(command_name)
+    }
+}
+
+/// Asks the shell's installed [`extensions::CommandInterceptor`], if any, to authorize an
+/// execution, and turns a refusal into the error the shell reports.
+///
+/// This is the one place that interprets an [`extensions::ExecDecision`]. Every site in
+/// brush that launches or replaces a process image calls it first, exactly once:
+/// [`execute_external_command`] before spawning, and the `exec` builtin before replacing
+/// the shell process. Callers outside brush that build a command with
+/// [`compose_std_command`] and run it themselves are responsible for calling this too.
+///
+/// # Errors
+///
+/// Returns [`error::ErrorKind::FailedToExecuteCommand`] wrapping a
+/// [`std::io::ErrorKind::PermissionDenied`] error whose payload is an
+/// [`error::ExecDeniedError`], so the shell reports exit status 126 and a host can recover
+/// the interceptor's reason by downcasting. Also returns that error, without consulting any
+/// policy, when the shell is
+/// [`AwaitingReinstall`](extensions::InterceptorSlot::AwaitingReinstall).
+pub fn authorize_execution<SE: extensions::ShellExtensions>(
+    shell: &Shell<SE>,
+    request: &extensions::ExecRequest<'_>,
+) -> Result<(), error::Error> {
+    let reason = match shell.command_interceptor() {
+        extensions::InterceptorSlot::Unconfined => return Ok(()),
+        extensions::InterceptorSlot::Installed(interceptor) => {
+            match interceptor.before_exec(request) {
+                extensions::ExecDecision::Allow => return Ok(()),
+                extensions::ExecDecision::Deny(reason) => reason,
+            }
+        }
+        extensions::InterceptorSlot::AwaitingReinstall => {
+            "shell was deserialized without its command interceptor; \
+             reinstall one with Shell::set_command_interceptor before executing"
+                .to_string()
+        }
+    };
+
+    Err(error::ErrorKind::FailedToExecuteCommand(
+        request.command_name.to_string(),
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            error::ExecDeniedError::new(reason),
+        ),
+    )
+    .into())
+}
+
 /// Composes a `std::process::Command` to execute the given command. Appropriately
 /// configures the command name and arguments, redirections, injected file
 /// descriptors, environment variables, etc.
@@ -169,6 +232,13 @@ impl<SE: extensions::ShellExtensions> std::ops::DerefMut for ShellForCommand<'_,
 /// * `args` - The arguments to pass to the command.
 /// * `empty_env` - If true, the command will be executed with an empty environment; if false, the
 ///   command will inherit environment variables marked as exported in the provided `Shell`.
+///
+/// # Authorization
+///
+/// This only *composes* the command; it does not run it and does not consult the shell's
+/// [`extensions::CommandInterceptor`]. Both in-tree callers call [`authorize_execution`]
+/// first. A caller outside brush that composes a command here and then runs it is
+/// responsible for authorizing it, or the shell's configured policy will not apply.
 #[allow(unused_variables, reason = "argv0 is only used on unix platforms")]
 pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
     context: &ExecutionContext<'_, SE>,
@@ -579,6 +649,24 @@ pub(crate) fn execute_external_command(
         })
         .collect::<Vec<_>>();
 
+    // argv[0] defaults to the user-facing command name unless the caller overrode it.
+    let argv0 = argv0_override.unwrap_or(context.command_name.as_str());
+
+    // Authorize before anything is spawned. Only allocate the borrowed arg slice when a
+    // policy is actually installed, so the unconfined path stays allocation-free.
+    if context.shell.command_interceptor().is_confined() {
+        let hook_args: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
+        authorize_execution(
+            context.shell,
+            &extensions::ExecRequest::new(
+                context.command_name.as_str(),
+                Path::new(executable_path),
+                OsStr::new(argv0),
+                hook_args.as_slice(),
+            ),
+        )?;
+    }
+
     // Before we lose ownership of the open files, figure out if stdin will be a terminal.
     let child_stdin_is_terminal = context
         .try_fd(openfiles::OpenFiles::STDIN_FD)
@@ -591,9 +679,6 @@ pub(crate) fn execute_external_command(
     );
 
     // Compose the std::process::Command that encapsulates what we want to launch.
-    // argv[0] defaults to context.command_name (the user-facing name of the
-    // command) unless the caller specified an explicit override.
-    let argv0 = argv0_override.unwrap_or(context.command_name.as_str());
     #[allow(unused_mut, reason = "only mutated on unix platforms")]
     let mut cmd = compose_std_command(
         &context,
