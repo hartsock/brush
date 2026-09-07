@@ -504,6 +504,9 @@ pub enum BraceExpressionMember {
         end: i64,
         /// Increment value.
         increment: i64,
+        /// Width to zero pad each member out to, set when either bound was
+        /// written with a leading zero.
+        zero_padded_width: Option<usize>,
     },
     /// An inclusive character sequence.
     CharSequence {
@@ -654,6 +657,41 @@ pub(crate) fn parse_array_assignment(
     })
 }
 
+/// Parses one bound of a numeric brace sequence, e.g. `-007`.
+///
+/// Returns `None` when the bound does not fit in an `i64`, which lets the sequence
+/// rule decline rather than panic on something like `{99999999999999999999..1}`.
+///
+/// The sign goes to the parser along with the digits, so `i64::MIN` is accepted even
+/// though its digits alone are one past `i64::MAX`.
+///
+/// # Arguments
+///
+/// * `text` - The bound as it was written, sign included.
+fn parse_sequence_bound(text: &str) -> Option<i64> {
+    text.parse().ok()
+}
+
+/// Returns the width the members of a numeric brace sequence should be zero
+/// padded out to, or `None` if they should be written as plain numbers.
+///
+/// A leading zero in either bound asks for padding, and the width is then the
+/// longer of the two bounds as they were written, sign included. A lone `0` is
+/// not a leading zero, and neither is a zero that follows a `+`.
+///
+/// # Arguments
+///
+/// * `start` - The start bound as it was written.
+/// * `end` - The end bound as it was written.
+fn zero_padded_width(start: &str, end: &str) -> Option<usize> {
+    fn has_leading_zero(bound: &str) -> bool {
+        let digits = bound.strip_prefix('-').unwrap_or(bound);
+        digits.len() > 1 && digits.starts_with('0')
+    }
+
+    (has_leading_zero(start) || has_leading_zero(end)).then(|| start.len().max(end.len()))
+}
+
 /// Parses literal array element text into optionally-keyed element words.
 ///
 /// # Arguments
@@ -748,12 +786,24 @@ peg::parser! {
             }
 
         pub(crate) rule brace_sequence_expr() -> BraceExpressionMember =
-            start:number() ".." end:number() increment:(".." n:number() { n })? {
-                BraceExpressionMember::NumberSequence { start, end, increment: increment.unwrap_or(1) }
+            start:sequence_bound() ".." end:sequence_bound() increment:(".." n:number() { n })? {
+                BraceExpressionMember::NumberSequence {
+                    start: start.0,
+                    end: end.0,
+                    increment: increment.unwrap_or(1),
+                    zero_padded_width: zero_padded_width(start.1, end.1),
+                }
             } /
             start:character() ".." end:character() increment:(".." n:number() { n })? {
                 BraceExpressionMember::CharSequence { start, end, increment: increment.unwrap_or(1) }
             }
+
+        // A bound of a numeric sequence, kept alongside the text it was written as.
+        // Whether the members come out zero padded is decided by that text and not
+        // by the value, so `{01..3}` and `{1..3}` have to stay distinguishable.
+        rule sequence_bound() -> (i64, &'input str) = text:$(number_sign()? ['0'..='9']+) {?
+            parse_sequence_bound(text).map(|n| (n, text)).ok_or("number out of range")
+        }
 
         rule number() -> i64 = sign:number_sign()? n:$(['0'..='9']+) {
             let sign = sign.unwrap_or(1);
@@ -958,9 +1008,12 @@ peg::parser! {
         rule tilde_expression() -> TildeExpr =
             &tilde_terminator() { TildeExpr::Home } /
             "+" &tilde_terminator() { TildeExpr::WorkingDir } /
-            plus:("+"?) n:$(['0'..='9']*) &tilde_terminator() { TildeExpr::NthDirFromTopOfDirStack { n: n.parse().unwrap(), plus_used: plus.is_some() } } /
+            // N.B. A run of digits need not fit in a `usize`; decline the rule
+            // when it does not, so the word falls through to being treated as a
+            // (non-existent) user name instead of panicking the parser.
+            plus:("+"?) n:$(['0'..='9']*) &tilde_terminator() {? n.parse().map_or_else(|_| Err("dir stack index out of range"), |n| Ok(TildeExpr::NthDirFromTopOfDirStack { n, plus_used: plus.is_some() })) } /
             "-" &tilde_terminator() { TildeExpr::OldWorkingDir } /
-            "-" n:$(['0'..='9']*) &tilde_terminator() { TildeExpr::NthDirFromBottomOfDirStack { n: n.parse().unwrap() } } /
+            "-" n:$(['0'..='9']*) &tilde_terminator() {? n.parse().map_or_else(|_| Err("dir stack index out of range"), |n| Ok(TildeExpr::NthDirFromBottomOfDirStack { n })) } /
             user:$(portable_filename_char()*) &tilde_terminator() { TildeExpr::UserHome(user.to_owned()) }
 
         rule tilde_terminator() = ['/' | ':' | ';' | '}'] / ![_]
@@ -1256,6 +1309,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_tilde_with_out_of_range_dir_stack_index() -> Result<()> {
+        // Regression: the dir-stack index was unwrapped, so a run of digits too
+        // large for a `usize` panicked the parser. It should fall through to
+        // being treated as a user name, which is what bash does with it.
+        // `~N` and `~-N` fall through to a user name; `~+N` cannot, because '+'
+        // is not a valid user-name character, so it stays literal text. Both
+        // match what bash does with an out-of-range index.
+        let parsed = super::parse("~99999999999999999999", &ParserOptions::default())?;
+        assert_eq!(parsed.len(), 1);
+        assert_matches!(
+            parsed[0].piece,
+            WordPiece::TildeExpansion(TildeExpr::UserHome(_))
+        );
+
+        let parsed = super::parse("~-99999999999999999999", &ParserOptions::default())?;
+        assert_eq!(parsed.len(), 1);
+        assert_matches!(
+            parsed[0].piece,
+            WordPiece::TildeExpansion(TildeExpr::UserHome(_))
+        );
+
+        let parsed = super::parse("~+99999999999999999999", &ParserOptions::default())?;
+        assert_eq!(parsed.len(), 1);
+        assert_matches!(parsed[0].piece, WordPiece::Text(_));
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_tilde_with_in_range_dir_stack_index() -> Result<()> {
+        let parsed = super::parse("~+2", &ParserOptions::default())?;
+        assert_eq!(parsed.len(), 1);
+        assert_matches!(
+            parsed[0].piece,
+            WordPiece::TildeExpansion(TildeExpr::NthDirFromTopOfDirStack { n: 2, .. })
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn parse_tilde_after_colon() -> Result<()> {
         let opts = ParserOptions {
             tilde_expansion_after_colon: true,
@@ -1459,5 +1553,51 @@ mod tests {
         assert!(parse("(unterminated").is_none());
         assert!(parse("plain text").is_none());
         assert!(parse("").is_none());
+    }
+
+    #[test]
+    fn parse_sequence_bound() {
+        assert_eq!(super::parse_sequence_bound("3"), Some(3));
+        assert_eq!(super::parse_sequence_bound("007"), Some(7));
+        assert_eq!(super::parse_sequence_bound("+7"), Some(7));
+        assert_eq!(super::parse_sequence_bound("-007"), Some(-7));
+        assert_eq!(super::parse_sequence_bound("0"), Some(0));
+        assert_eq!(super::parse_sequence_bound("-0"), Some(0));
+        assert_eq!(super::parse_sequence_bound("99999999999999999999"), None);
+
+        // The digits of `i64::MIN` are one past `i64::MAX`, so the sign has to be parsed with them.
+        assert_eq!(
+            super::parse_sequence_bound("-9223372036854775808"),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            super::parse_sequence_bound("9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(super::parse_sequence_bound("-9223372036854775809"), None);
+    }
+
+    #[test]
+    fn zero_padded_width() {
+        let width = super::zero_padded_width;
+
+        // Neither bound was written with a leading zero.
+        assert_eq!(width("1", "5"), None);
+        assert_eq!(width("0", "10"), None);
+        assert_eq!(width("-0", "3"), None);
+
+        // The width is the longer bound as written, whichever one asked for padding.
+        assert_eq!(width("01", "5"), Some(2));
+        assert_eq!(width("1", "005"), Some(3));
+        assert_eq!(width("0009", "11"), Some(4));
+
+        // A sign takes one of the columns.
+        assert_eq!(width("-01", "01"), Some(3));
+        assert_eq!(width("00", "-3"), Some(2));
+
+        // A zero after a plus does not ask for padding, though the text still
+        // counts toward the width once the other bound has asked.
+        assert_eq!(width("+01", "3"), None);
+        assert_eq!(width("+01", "05"), Some(3));
     }
 }
