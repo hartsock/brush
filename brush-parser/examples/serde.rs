@@ -1,6 +1,6 @@
 //! Example demonstrating AST serialization and deserialization with the `serde` feature.
 //!
-//! Run with: `cargo run --package brush-parser --example serde --features serde`
+//! Run with: `cargo run --package brush-ocap-parser --example serde --features serde`
 
 use brush_parser::{Parser, ParserOptions};
 use std::io::BufReader;

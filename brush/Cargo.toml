@@ -1,5 +1,6 @@
 [package]
 name = "brush"
+publish = false
 description = "Rust-implemented shell focused on POSIX and bash compatibility"
 version = "0.4.0"
 authors.workspace = true

@@ -101,8 +101,8 @@ Confirm the value the library tier will publish, which is what downstream consum
 package rather than trusting the source manifest:
 
 ```bash
-cargo package --no-verify -p brush-core
-tar -xzOf target/package/brush-core-*.crate '*/Cargo.toml' | grep rust-version
+cargo package --no-verify -p brush-ocap-core
+tar -xzOf target/package/brush-ocap-core-*.crate '*/Cargo.toml' | grep rust-version
 ```
 
 ### 4. Run tests
