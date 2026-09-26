@@ -326,6 +326,52 @@ impl<'a, SE: ShellExtensions> SourceScriptParams<'a, SE> {
 // External command builder (introspectable)
 //
 
+/// An explicitly owned descriptor capability delegated to one Unix child.
+///
+/// This does not open a path or expose an ambient descriptor: the caller must
+/// already own the source. Standard streams retain the shell's redirections.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct DelegatedFd {
+    target: crate::ShellFd,
+    source: std::sync::Arc<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl DelegatedFd {
+    /// Owns a source descriptor for delegation to a child descriptor above stderr.
+    pub fn new(target: crate::ShellFd, source: std::os::fd::OwnedFd) -> Result<Self, error::Error> {
+        if target <= crate::openfiles::OpenFiles::STDERR_FD || target == crate::ShellFd::MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "delegated descriptor target must be above stderr and below the mapping sentinel",
+            )
+            .into());
+        }
+        // OwnedFd by itself does not imply CLOEXEC (for example, dup() clears
+        // it). Its safe clone operation atomically creates a CLOEXEC descriptor;
+        // close the original before returning so unrelated spawns cannot inherit
+        // an ambient source retained by this capability.
+        let private_source = source.try_clone()?;
+        drop(source);
+        Ok(Self {
+            target,
+            source: std::sync::Arc::new(private_source.into()),
+        })
+    }
+
+    /// Returns the descriptor number requested in the child.
+    pub const fn target(&self) -> crate::ShellFd {
+        self.target
+    }
+
+    /// Borrows the owned source capability for final policy inspection.
+    pub fn source(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.source.as_fd()
+    }
+}
+
 /// An introspectable command builder for external process execution.
 ///
 /// Unlike `std::process::Command`, this type allows inspection of all
@@ -348,6 +394,8 @@ pub struct ExternalCommand {
     envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     current_dir: Option<std::path::PathBuf>,
     env_clear: bool,
+    #[cfg(unix)]
+    delegated_fds: Vec<DelegatedFd>,
 }
 
 impl ExternalCommand {
@@ -360,6 +408,8 @@ impl ExternalCommand {
             envs: Vec::new(),
             current_dir: None,
             env_clear: false,
+            #[cfg(unix)]
+            delegated_fds: Vec::new(),
         }
     }
 
@@ -468,10 +518,44 @@ impl ExternalCommand {
         self
     }
 
+    /// Delegates an already-owned descriptor to this child only.
+    ///
+    /// The final authorization hook sees every delegation. Duplicate targets
+    /// and collisions with shell redirections fail before the child is spawned.
+    #[cfg(unix)]
+    pub fn delegate_fd(&mut self, descriptor: DelegatedFd) -> Result<&mut Self, error::Error> {
+        if self
+            .delegated_fds
+            .iter()
+            .any(|fd| fd.target == descriptor.target)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "duplicate delegated descriptor target",
+            )
+            .into());
+        }
+        self.delegated_fds.push(descriptor);
+        Ok(self)
+    }
+
+    /// Returns the exact descriptor capabilities proposed for the child.
+    #[cfg(unix)]
+    pub fn delegated_fds(&self) -> &[DelegatedFd] {
+        &self.delegated_fds
+    }
+
     /// Converts this into a `std::process::Command`.
-    #[must_use]
-    pub fn into_std_command(self) -> std::process::Command {
+    pub fn into_std_command(self) -> Result<std::process::Command, error::Error> {
+        self.to_std_command_with_fds(std::iter::empty())
+    }
+
+    pub(crate) fn to_std_command_with_fds(
+        &self,
+        open_files: impl Iterator<Item = (crate::ShellFd, crate::openfiles::OpenFile)>,
+    ) -> Result<std::process::Command, error::Error> {
         use crate::sys::commands::CommandExt as _;
+        use crate::sys::commands::CommandFdInjectionExt as _;
         let mut cmd = std::process::Command::new(&self.program);
 
         if let Some(argv0) = &self.argv0 {
@@ -492,7 +576,27 @@ impl ExternalCommand {
             cmd.current_dir(dir);
         }
 
-        cmd
+        #[allow(unused_mut, reason = "explicit delegation is currently Unix-specific")]
+        let mut open_files = open_files.collect::<Vec<_>>();
+        #[cfg(unix)]
+        for delegated in &self.delegated_fds {
+            if open_files
+                .iter()
+                .any(|(target, _)| *target == delegated.target)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "delegated descriptor collides with a shell redirection",
+                )
+                .into());
+            }
+            open_files.push((
+                delegated.target,
+                crate::openfiles::OpenFile::File(delegated.source.clone()),
+            ));
+        }
+        cmd.inject_fds(open_files.into_iter())?;
+        Ok(cmd)
     }
 }
 
@@ -576,6 +680,21 @@ pub trait CmdExecFilter: Clone + Default + Send + Sync + 'static {
     fn authorize_external_cmd<SE: ShellExtensions>(
         &self,
         _params: &ExternalCmdParams<'_, SE>,
+    ) -> impl std::future::Future<Output = Result<(), error::Error>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Observes a successfully spawned child and the exact authorized command.
+    ///
+    /// The child can already run, but its spawn result is not exposed until this
+    /// hook completes. A failure terminates and reaps that child, then propagates
+    /// as a terminating shell error. Embedders may use this to register a scoped
+    /// capability before answering requests from the child. This is not called
+    /// for failed spawns or successful `exec`, which replaces the shell itself.
+    fn external_cmd_spawned(
+        &self,
+        _command: &ExternalCommand,
+        _pid: Option<u32>,
     ) -> impl std::future::Future<Output = Result<(), error::Error>> + Send {
         async { Ok(()) }
     }
@@ -734,6 +853,15 @@ impl<First: FileOpenFilter, Second: FileOpenFilter> FileOpenFilter for FilterSta
 }
 
 impl<First: CmdExecFilter, Second: CmdExecFilter> CmdExecFilter for FilterStack<First, Second> {
+    async fn external_cmd_spawned(
+        &self,
+        command: &ExternalCommand,
+        pid: Option<u32>,
+    ) -> Result<(), error::Error> {
+        self.second.external_cmd_spawned(command, pid).await?;
+        self.first.external_cmd_spawned(command, pid).await
+    }
+
     async fn authorize_external_cmd<SE: ShellExtensions>(
         &self,
         params: &ExternalCmdParams<'_, SE>,
@@ -974,7 +1102,7 @@ mod tests {
             .env_clear()
             .env("Path", "first")
             .env("PATH", "second");
-        let actual = command.into_std_command();
+        let actual = command.into_std_command().unwrap();
         assert_eq!(
             actual.get_envs().collect::<Vec<_>>(),
             expected.get_envs().collect::<Vec<_>>()
@@ -991,7 +1119,7 @@ mod tests {
             .env("PATH", "second");
 
         assert_eq!(command.envs().len(), 2);
-        let actual = command.into_std_command();
+        let actual = command.into_std_command().unwrap();
         let mut expected = std::process::Command::new("fixture");
         expected
             .env_clear()

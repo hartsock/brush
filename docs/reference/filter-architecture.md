@@ -309,3 +309,37 @@ Future filters face granularity tradeoffs:
 - **Fine**: Separate hooks per expansion type (complex, precise control)
 - Current `CmdExecFilter` uses fine granularity (`pre_simple_cmd` + `pre_external_cmd`)
 - Recommendation: Start fine-grained, compose via `FilterStack` for coarser needs
+
+## Explicit descriptor delegation
+
+On Unix, `ExternalCommand` may carry `DelegatedFd` values: an already-owned
+source descriptor and an explicit child target above stderr. Filters can inspect
+`delegated_fds()` during final authorization. The runtime merges these with the
+shell's existing descriptor mappings and rejects duplicate targets or collisions
+with redirections before spawning. Descriptor delegation does not change the
+command's arguments, environment, working directory, or standard streams.
+`into_std_command()` is fallible so descriptor-duplication errors are reported.
+Admission normalizes the owned source to close-on-exec; unrelated children do
+not inherit a retained source descriptor. Filter code correlating capabilities
+by their source descriptor must inspect the admitted `DelegatedFd`, since its
+descriptor number may differ from the caller's original source.
+
+The static `external_cmd_spawned` hook receives the exact authorized command and
+the spawned process ID before Brush exposes the spawn result. This allows an
+embedder to register a specific process against its delegated capability,
+without relying on pipeline ordering or a shared last-command slot. The child
+may already be running: a broker must withhold replies until registration is
+acknowledged. If the hook refuses registration, Brush terminates and reaps the
+child and propagates a terminating error. Failed spawns and successful `exec`
+replacement do not call this hook. Cancellation while registration is pending
+terminates the child even when ordinary shell children would survive a dropped
+waiter. Successful registration restores the configured lifecycle policy;
+worker embedders should enable `kill_external_commands_on_drop` for subsequent
+execution as well.
+
+A private broker can use this mechanism without granting a new filesystem path
+or network destination. Possession of a transport endpoint is not permission to
+sign arbitrary data: the parent must still validate invocation identity,
+canonical payloads, sequence, and actual transaction results. Windows requires
+an equivalent owned-handle mapping through an explicit handle list; this Unix
+API does not claim to provide that Windows transport.

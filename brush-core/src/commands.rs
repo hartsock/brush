@@ -10,7 +10,7 @@ use std::{
 
 use brush_parser::ast;
 use itertools::Itertools;
-use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt};
+use sys::commands::{CommandExt, CommandFgControlExt};
 
 use crate::{
     ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult,
@@ -247,7 +247,21 @@ pub fn compose_filtered_std_command<SE: extensions::ShellExtensions>(
     context: &ExecutionContext<'_, SE>,
     command: ExternalCommand,
 ) -> Result<std::process::Command, error::Error> {
-    let mut cmd = command.into_std_command();
+    let result = compose_filtered_std_command_ref(context, &command);
+    drop(command);
+    result
+}
+
+fn compose_filtered_std_command_ref<SE: extensions::ShellExtensions>(
+    context: &ExecutionContext<'_, SE>,
+    command: &ExternalCommand,
+) -> Result<std::process::Command, error::Error> {
+    // Build one descriptor mapping, so overlapping source/target numbers are
+    // resolved together and delegated capabilities cannot replace redirections.
+    let other_files = context.iter_fds().filter(|(fd, _)| {
+        *fd != OpenFiles::STDIN_FD && *fd != OpenFiles::STDOUT_FD && *fd != OpenFiles::STDERR_FD
+    });
+    let mut cmd = command.to_std_command_with_fds(other_files)?;
 
     // Redirect stdin, if applicable.
     match context.try_fd(OpenFiles::STDIN_FD) {
@@ -275,12 +289,6 @@ pub fn compose_filtered_std_command<SE: extensions::ShellExtensions>(
             cmd.stderr(as_stdio);
         }
     }
-
-    // Inject any other fds.
-    let other_files = context.iter_fds().filter(|(fd, _)| {
-        *fd != OpenFiles::STDIN_FD && *fd != OpenFiles::STDOUT_FD && *fd != OpenFiles::STDERR_FD
-    });
-    cmd.inject_fds(other_files)?;
 
     Ok(cmd)
 }
@@ -637,7 +645,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
                             command_name,
                             params,
                         };
-                        execute_external_command(cmd_context, command, process_group_id)
+                        execute_external_command(cmd_context, command, process_group_id).await
                     }
                     Err(error) => Err(error),
                 }
@@ -654,7 +662,24 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     }
 }
 
-pub(crate) fn execute_external_command(
+/// Keeps a spawned child owned while its asynchronous registration is pending.
+/// Ordinary shell lifecycle settings apply only after the filter acknowledges it.
+struct PendingChildRegistration<'a> {
+    child: &'a mut sys::process::Child,
+    acknowledged: bool,
+}
+
+impl Drop for PendingChildRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            if let Err(error) = self.child.start_kill() {
+                tracing::warn!(%error, "failed to stop child with incomplete registration");
+            }
+        }
+    }
+}
+
+pub(crate) async fn execute_external_command(
     context: ExecutionContext<'_, impl extensions::ShellExtensions>,
     command: ExternalCommand,
     process_group_id: Option<i32>,
@@ -671,7 +696,7 @@ pub(crate) fn execute_external_command(
     );
 
     #[allow(unused_mut, reason = "only mutated on unix platforms")]
-    let mut cmd = compose_filtered_std_command(&context, command)?;
+    let mut cmd = compose_filtered_std_command_ref(&context, &command)?;
 
     // Set up process group state.
     if new_pg {
@@ -704,7 +729,26 @@ pub(crate) fn execute_external_command(
     );
 
     match sys::process::spawn(cmd, context.shell.options().kill_external_commands_on_drop) {
-        Ok(child) => {
+        Ok(mut child) => {
+            {
+                let mut registration = PendingChildRegistration {
+                    child: &mut child,
+                    acknowledged: false,
+                };
+                if let Err(error) = context
+                    .shell
+                    .cmd_exec_filter()
+                    .external_cmd_spawned(&command, registration.child.id())
+                    .await
+                {
+                    if let Err(cleanup_error) = registration.child.kill().await {
+                        tracing::warn!(%cleanup_error, "failed to kill unregistered child; waiting for exit");
+                        let _ = registration.child.wait().await;
+                    }
+                    return Err(error.into_terminating());
+                }
+                registration.acknowledged = true;
+            }
             // Retrieve the pid.
             #[expect(clippy::cast_possible_wrap)]
             let pid = child.id().map(|id| id as i32);
