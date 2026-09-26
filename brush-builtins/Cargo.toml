@@ -1,7 +1,7 @@
 [package]
-name = "brush-builtins"
+name = "brush-ocap-builtins"
 description = "Builtins for a POSIX/bash shell (used by brush-shell)"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 categories.workspace = true
 edition.workspace = true
 keywords.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [lib]
+name = "brush_builtins"
 bench = false
 
 [features]
@@ -128,8 +129,8 @@ default = [
 workspace = true
 
 [dependencies]
-brush-core = { version = "^0.5.0", path = "../brush-core" }
-brush-parser = { version = "^0.4.0", path = "../brush-parser" }
+brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1", path = "../brush-core" }
+brush-parser = { package = "brush-ocap-parser", version = "=0.5.0-rc.1", path = "../brush-parser" }
 cfg-if = "1.0.4"
 chrono = "0.4.44"
 clap = { version = "4.6.0", features = ["derive", "wrap_help"] }

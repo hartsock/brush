@@ -1,3 +1,36 @@
+## OCAP filter fork
+
+This checkout is the [hartsock/brush](https://github.com/hartsock/brush) fork.
+Its library release candidates preserve the Rust import names while using
+distinct package identities:
+
+| Package | Candidate version | Rust import |
+| --- | --- | --- |
+| `brush-ocap-parser` | `0.5.0-rc.1` | `brush_parser` |
+| `brush-ocap-core` | `0.6.0-rc.1` | `brush_core` |
+| `brush-ocap-builtins` | `0.3.0-rc.1` | `brush_builtins` |
+| `brush-ocap-coreutils-builtins` | `0.2.0-rc.1` | `brush_coreutils_builtins` |
+
+Embedders migrating from the earlier fork's interceptor use static
+`CmdExecFilter`, `SourceFilter`, and `FileOpenFilter` policies through
+`ShellExtensionsImpl`. File opens carry typed read/write access, marked
+terminating refusals stop execution, and serialized shells preserve installed
+policies or reject unsupported serialization. File policy covers shell opens;
+external-process confinement remains the embedder's responsibility.
+
+Use dependency aliases with exact candidate requirements, for example:
+
+```toml
+brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1" }
+```
+
+See [filter architecture](docs/reference/filter-architecture.md) and the
+[fork release procedure](FORK_RELEASE.md) for integration and validation.
+These candidate versions are not a publication record. Only the four library
+packages are publishable from this checkout; application packages retain their
+upstream names with publication disabled. The upstream project overview and
+application installation instructions follow.
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/extras/brand/brush-wordmark-white.svg">

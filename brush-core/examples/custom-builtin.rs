@@ -9,7 +9,7 @@
 //!
 //! Run this example with:
 //! ```bash
-//! cargo run --package brush-core --example custom-builtin
+//! cargo run --package brush-ocap-core --example custom-builtin
 //! ```
 
 use anyhow::Result;
