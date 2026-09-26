@@ -576,26 +576,28 @@ impl ExternalCommand {
             cmd.current_dir(dir);
         }
 
-        #[allow(unused_mut, reason = "explicit delegation is currently Unix-specific")]
-        let mut open_files = open_files.collect::<Vec<_>>();
         #[cfg(unix)]
-        for delegated in &self.delegated_fds {
-            if open_files
-                .iter()
-                .any(|(target, _)| *target == delegated.target)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "delegated descriptor collides with a shell redirection",
-                )
-                .into());
+        let open_files = {
+            let mut mappings = open_files.collect::<Vec<_>>();
+            for delegated in &self.delegated_fds {
+                if mappings
+                    .iter()
+                    .any(|(target, _)| *target == delegated.target)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "delegated descriptor collides with a shell redirection",
+                    )
+                    .into());
+                }
+                mappings.push((
+                    delegated.target,
+                    crate::openfiles::OpenFile::File(delegated.source.clone()),
+                ));
             }
-            open_files.push((
-                delegated.target,
-                crate::openfiles::OpenFile::File(delegated.source.clone()),
-            ));
-        }
-        cmd.inject_fds(open_files.into_iter())?;
+            mappings.into_iter()
+        };
+        cmd.inject_fds(open_files)?;
         Ok(cmd)
     }
 }
