@@ -1,7 +1,14 @@
 use clap::Parser;
-use std::{borrow::Cow, os::unix::process::CommandExt};
+use std::{
+    borrow::Cow,
+    ffi::OsStr,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+};
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
+use brush_core::{
+    ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands, extensions::ExecRequest,
+};
 
 /// Exec the provided command.
 #[derive(Parser)]
@@ -64,9 +71,42 @@ impl builtins::Command for ExecCommand {
             argv0 = Cow::Owned(std::format!("-{argv0}"));
         }
 
+        // `exec` replaces this process image outright, so it never reaches
+        // `commands::execute_external_command`. Authorize here, before `cmd.exec()`, using
+        // the same brush-core helper that path uses -- this builtin must not interpret
+        // policy itself.
+        //
+        // When confined we resolve the program first and launch *that* exact path, so what
+        // the interceptor authorized is what runs; the OS would otherwise redo its own
+        // `PATH` search against the child environment, which need not match the shell's.
+        // Unconfined, behavior is byte-for-byte what it was before.
+        let mut program_to_launch: Cow<'_, str> = Cow::Borrowed(self.args[0].as_str());
+        if context.shell.command_interceptor().is_confined() {
+            let resolved: Option<PathBuf> =
+                commands::resolve_external_program(context.shell, &self.args[0]);
+            let program: &Path = resolved
+                .as_deref()
+                .unwrap_or_else(|| Path::new(self.args[0].as_str()));
+
+            let hook_args: Vec<&str> = self.args[1..].iter().map(String::as_str).collect();
+            commands::authorize_execution(
+                context.shell,
+                &ExecRequest::new(
+                    self.args[0].as_str(),
+                    program,
+                    OsStr::new(argv0.as_ref().as_str()),
+                    hook_args.as_slice(),
+                ),
+            )?;
+
+            if let Some(resolved) = resolved {
+                program_to_launch = Cow::Owned(resolved.to_string_lossy().into_owned());
+            }
+        }
+
         let mut cmd = commands::compose_std_command(
             &context,
-            &self.args[0],
+            program_to_launch.as_ref(),
             argv0.as_str(),
             &self.args[1..],
             self.empty_environment,
