@@ -216,6 +216,7 @@ impl Execute for ast::Program {
             // errors.
             match command.execute(shell, params).await {
                 Ok(exec_result) => result = exec_result,
+                Err(err) if err.is_terminating() => return Err(err),
                 Err(err) => {
                     // Display the error and convert to an execution result.
                     let _ = shell.display_error(&mut params.stderr(shell), &err);
@@ -630,10 +631,26 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::Command {
                     }
                 }
 
-                Ok(compound
-                    .execute(&mut pipeline_context.shell, &params)
-                    .await?
-                    .into())
+                match pipeline_context.shell {
+                    // When we own our shell, we're one of multiple stages in a pipeline; spawn so
+                    // we run concurrently with the others. Running inline would block forever once
+                    // we filled the pipe, because the stage that drains it isn't started until we
+                    // return.
+                    commands::ShellForCommand::OwnedShell { target, .. } => {
+                        let mut shell = *target;
+                        // N.B. We clone the command so the spawned task can own it.
+                        let compound = compound.clone();
+                        Ok(ExecutionSpawnResult::StartedTask(
+                            tokio::task::spawn_blocking(move || {
+                                let rt = tokio::runtime::Handle::current();
+                                rt.block_on(compound.execute(&mut shell, &params))
+                            }),
+                        ))
+                    }
+                    commands::ShellForCommand::ParentShell(shell) => {
+                        Ok(compound.execute(shell, &params).await?.into())
+                    }
+                }
             }
             Self::Function(func) => Ok(func
                 .execute(&mut pipeline_context.shell, &params)
@@ -668,6 +685,7 @@ impl Execute for ast::CompoundCommand {
                 // from propagating to the parent shell.
                 let subshell_result = match list.execute(&mut subshell, params).await {
                     Ok(result) => result,
+                    Err(error) if error.is_terminating() => return Err(error),
                     Err(error) => {
                         // Display the error to stderr, but prevent fatal error propagation
                         let mut stderr = params.stderr(shell);
@@ -799,17 +817,12 @@ impl Execute for ast::ForClauseCommand {
 
         // If we were given explicit words to iterate over, then expand them all, with splitting
         // enabled.
-        let mut expanded_values = vec![];
-        if let Some(unexpanded_values) = &self.values {
-            for value in unexpanded_values {
-                let mut expanded =
-                    expansion::full_expand_and_split_word(shell, params, value).await?;
-                expanded_values.append(&mut expanded);
-            }
+        let expanded_values = if let Some(unexpanded_values) = &self.values {
+            expand_words(shell, params, unexpanded_values).await?
         } else {
             // Otherwise, we use the current positional parameters.
-            expanded_values.extend_from_slice(shell.current_shell_args());
-        }
+            shell.current_shell_args().to_vec()
+        };
 
         for value in expanded_values {
             if shell.options().print_commands_and_arguments {
@@ -1169,6 +1182,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                 CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                     if let Err(e) = setup_redirect(&mut context.shell, &mut params, redirect).await
                     {
+                        if e.is_terminating() {
+                            return Err(e);
+                        }
                         writeln!(params.stderr(&context.shell), "error: {e}")?;
                         return Ok(ExecutionResult::general_error().into());
                     }
@@ -1226,17 +1242,21 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 
                     if args.is_empty() {
                         if let Some(cmd_name) = next_args.first() {
-                            if let Some(alias_value) =
-                                context.shell.aliases().get(cmd_name.as_str())
+                            // Aliases are only expanded when `expand_aliases` is enabled; it's
+                            // enabled by default for interactive shells.
+                            if context.shell.options().expand_aliases
+                                && let Some(alias_value) =
+                                    context.shell.aliases().get(cmd_name.as_str())
                             {
                                 //
                                 // TODO(#57): This is a total hack; aliases are supposed to be
                                 // handled much earlier in the process.
                                 //
-                                let mut alias_pieces: Vec<_> = alias_value
-                                    .split_ascii_whitespace()
-                                    .map(|i| i.to_owned())
-                                    .collect();
+                                // N.B. Tokenizing first releases our borrow of the shell's aliases,
+                                // so we can take a mutable borrow of the shell to expand the words.
+                                let alias_words = tokenize_alias_body(&context.shell, alias_value);
+                                let mut alias_pieces =
+                                    expand_words(&mut context.shell, &params, alias_words).await?;
 
                                 next_args.remove(0);
                                 alias_pieces.append(&mut next_args);
@@ -1244,15 +1264,15 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                                 next_args = alias_pieces;
                             }
 
-                            let first_arg = next_args[0].as_str();
-
                             // Check if we're going to be invoking a special declaration builtin.
-                            // That will change how we parse and process args.
-                            if context
-                                .shell
-                                .builtins()
-                                .get(first_arg)
-                                .is_some_and(|r| !r.disabled && r.declaration_builtin)
+                            // That will change how we parse and process args. (An alias with an
+                            // empty body leaves us with no words at all.)
+                            if let Some(first_arg) = next_args.first()
+                                && context
+                                    .shell
+                                    .builtins()
+                                    .get(first_arg.as_str())
+                                    .is_some_and(|r| !r.disabled && r.declaration_builtin)
                             {
                                 command_takes_assignments = true;
                             }
@@ -1290,6 +1310,7 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
 
             match execute_command(context, params, cmd_name, &assignments, &args).await {
                 Ok(result) => Ok(result),
+                Err(err) if err.is_terminating() => Err(err),
                 Err(err) => {
                     let _ = parent_shell.display_error(&mut stderr, &err);
 
@@ -1380,12 +1401,57 @@ async fn execute_command<T: Into<String>>(
     // Arrange to pop off that ephemeral environment scope.
     cmd.post_execute = Some(|shell| shell.env_mut().pop_scope(EnvironmentScope::Command));
 
-    // Run through any pre-execution hooks as best effort.
-    let _ = commands::on_preexecute(&mut cmd).await;
+    // Ordinary hook errors remain best effort; an explicit terminating error
+    // prevents dispatch and must still release the command environment scope.
+    if let Err(error) = commands::on_preexecute(&mut cmd).await
+        && error.is_terminating()
+    {
+        cmd.complete_without_execution();
+        return Err(error);
+    }
 
     // Execute
     // TODO(jobs): do we need to move self back to foreground on error here?
     cmd.execute().await
+}
+
+/// Tokenizes the body of an alias into the unexpanded words that should replace the aliased command
+/// name.
+///
+/// This only handles alias bodies that amount to a simple sequence of words; bodies containing
+/// operators (pipes, redirections, `&&`, ...) and recursive expansion of chained aliases require
+/// alias substitution to happen in the tokenizer instead (see issue #57).
+fn tokenize_alias_body(
+    shell: &Shell<impl extensions::ShellExtensions>,
+    alias_value: &str,
+) -> Vec<String> {
+    // Tokenize the body the same way the shell would tokenize any other input it's given.
+    let options = shell.parser_options().tokenizer_options();
+
+    // If we can't tokenize the body, fall back to naively splitting it on whitespace.
+    brush_parser::tokenize_str_with_options(alias_value, &options).map_or_else(
+        |_| {
+            alias_value
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect()
+        },
+        |tokens| tokens.iter().map(|t| t.to_str().to_owned()).collect(),
+    )
+}
+
+/// Expands the given words, with splitting enabled, yielding the fields they expand to.
+async fn expand_words(
+    shell: &mut Shell<impl extensions::ShellExtensions>,
+    params: &ExecutionParameters,
+    words: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<Vec<String>, error::Error> {
+    // N.B. Expansion needs `&mut shell`, so the words have to be expanded in sequence.
+    let mut fields = vec![];
+    for word in words {
+        fields.extend(expansion::full_expand_and_split_word(shell, params, word).await?);
+    }
+    Ok(fields)
 }
 
 async fn expand_assignment(
@@ -1652,8 +1718,8 @@ pub(crate) async fn setup_redirect(
                         return Err(error::ErrorKind::InvalidRedirection.into());
                     }
 
-                    let expanded_file_path: PathBuf =
-                        shell.absolute_path(Path::new(expanded_fields.remove(0).as_str()));
+                    let requested_file_path = PathBuf::from(expanded_fields.remove(0));
+                    let expanded_file_path = shell.absolute_path(&requested_file_path);
 
                     let default_fd_if_unspecified = get_default_fd_for_redirect_kind(kind);
                     match kind {
@@ -1704,13 +1770,33 @@ pub(crate) async fn setup_redirect(
 
                     let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
 
+                    let access = match kind {
+                        ast::IoFileRedirectKind::Read | ast::IoFileRedirectKind::DuplicateInput => {
+                            crate::filter::FileOpenAccess::Read
+                        }
+                        ast::IoFileRedirectKind::ReadAndWrite => {
+                            crate::filter::FileOpenAccess::ReadWrite
+                        }
+                        ast::IoFileRedirectKind::Write
+                        | ast::IoFileRedirectKind::Append
+                        | ast::IoFileRedirectKind::Clobber
+                        | ast::IoFileRedirectKind::DuplicateOutput => {
+                            crate::filter::FileOpenAccess::Write
+                        }
+                    };
+
                     let opened_file = shell
-                        .open_file(&options, &expanded_file_path, params)
+                        .open_file(&options, access, &requested_file_path, params)
                         .map_err(|err| {
-                            error::ErrorKind::RedirectionFailure(
-                                expanded_file_path.to_string_lossy().to_string(),
-                                err.to_string(),
-                            )
+                            if err.is_terminating() {
+                                err
+                            } else {
+                                error::ErrorKind::RedirectionFailure(
+                                    expanded_file_path.to_string_lossy().to_string(),
+                                    err.to_string(),
+                                )
+                                .into()
+                            }
                         })?;
 
                     params.open_files.set_fd(fd_num, opened_file);
@@ -1874,12 +1960,22 @@ fn setup_redirect_output_and_error_to(
         .append(append);
 
     let stdout_file = shell
-        .open_file(&file_options, &abs_file_path, params)
+        .open_file(
+            &file_options,
+            crate::filter::FileOpenAccess::Write,
+            file_path,
+            params,
+        )
         .map_err(|err| {
-            error::ErrorKind::RedirectionFailure(
-                abs_file_path.to_string_lossy().to_string(),
-                err.to_string(),
-            )
+            if err.is_terminating() {
+                err
+            } else {
+                error::ErrorKind::RedirectionFailure(
+                    abs_file_path.to_string_lossy().to_string(),
+                    err.to_string(),
+                )
+                .into()
+            }
         })?;
 
     let stderr_file = stdout_file.clone();

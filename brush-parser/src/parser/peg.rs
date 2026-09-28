@@ -19,7 +19,7 @@ peg::parser! {
         rule complete_command() -> ast::CompleteCommand =
             first:and_or() remainder:(s:separator_op() l:and_or() { (s, l) })* last_sep:separator_op()? {
                 let mut and_ors = vec![first];
-                let mut seps = vec![];
+                let mut seps = Vec::with_capacity(remainder.len());
 
                 for (sep, ao) in remainder {
                     seps.push(sep);
@@ -29,10 +29,7 @@ peg::parser! {
                 // N.B. We default to synchronous if no separator op is given.
                 seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
 
-                let mut items = vec![];
-                for (i, ao) in and_ors.into_iter().enumerate() {
-                    items.push(ast::CompoundListItem(ao, seps[i].clone()));
-                }
+                let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
                 ast::CompoundList(items)
             }
@@ -146,7 +143,7 @@ peg::parser! {
         rule compound_list() -> ast::CompoundList =
             linebreak() first:and_or() remainder:(s:separator() l:and_or() { (s, l) })* last_sep:separator()? {
                 let mut and_ors = vec![first];
-                let mut seps = vec![];
+                let mut seps = Vec::with_capacity(remainder.len());
 
                 for (sep, ao) in remainder {
                     seps.push(sep.unwrap_or(SeparatorOperator::Sequence));
@@ -157,10 +154,7 @@ peg::parser! {
                 let last_sep = last_sep.unwrap_or(None);
                 seps.push(last_sep.unwrap_or(SeparatorOperator::Sequence));
 
-                let mut items = vec![];
-                for (i, ao) in and_ors.into_iter().enumerate() {
-                    items.push(ast::CompoundListItem(ao, seps[i].clone()));
-                }
+                let items = and_ors.into_iter().enumerate().map(|(i, ao)| ast::CompoundListItem(ao, seps[i].clone())).collect();
 
                 ast::CompoundList(items)
             }
@@ -379,10 +373,8 @@ peg::parser! {
 
         rule else_part() -> Vec<ast::ElseClause> =
             cs:_conditional_else_part()+ u:_unconditional_else_part()? {
-                let mut parts = vec![];
-                for c in cs {
-                    parts.push(c);
-                }
+                let mut parts = Vec::with_capacity(cs.len() + 1);
+                parts.extend(cs);
 
                 if let Some(uncond) = u {
                     parts.push(uncond);
@@ -707,9 +699,13 @@ peg::parser! {
             [Token::Word(w, num_loc) if w.chars().all(|c: char| c.is_ascii_digit())]
             &([Token::Operator(o, redir_loc) if
                     o.starts_with(['<', '>']) &&
-                    locations_are_contiguous(num_loc, redir_loc)]) {
+                    locations_are_contiguous(num_loc, redir_loc)]) {?
 
-                w.parse().unwrap()
+                // A run of ASCII digits still need not fit in an `IoFd`; e.g.
+                // `echo 99999999999999999999>&1` overflows. Decline the rule
+                // instead of unwrapping, so the token is reconsidered as an
+                // ordinary word rather than panicking the parser.
+                w.parse().map_err(|_| "io number out of range")
             }
 
         //

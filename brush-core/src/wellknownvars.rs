@@ -245,7 +245,15 @@ pub(crate) fn init_well_known_vars(
                 let since_epoch = now
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
-                since_epoch.as_secs_f64().to_string().into()
+                // Match bash: seconds with exactly six fractional (microsecond) digits,
+                // zero-padded. Tools strip the dot and do integer math on the result
+                // (atuin computes command durations this way), so the width must be fixed.
+                std::format!(
+                    "{}.{:06}",
+                    since_epoch.as_secs(),
+                    since_epoch.subsec_micros()
+                )
+                .into()
             },
             setter: |_| (),
         }),
@@ -733,9 +741,7 @@ fn get_bash_argv_value(shell: &dyn ShellState) -> variables::ShellValue {
     for frame in shell.call_stack().iter() {
         if let Some(args) = frame_bash_args(frame, extdebug) {
             // Push args in reverse order per frame (last arg at lowest index = top of stack)
-            for arg in args.iter().rev() {
-                argv.push(arg.clone());
-            }
+            argv.extend(args.iter().cloned().rev());
         }
     }
 

@@ -1,5 +1,6 @@
+use brush_core::trace_categories;
 use nu_ansi_term::Style;
-use reedline::MenuBuilder;
+use reedline::{Menu as _, MenuBuilder};
 
 use super::{completer, edit_mode, highlighter, history, validator};
 use crate::{InputBackend, ReadResult, ShellError, input_backend::InteractivePrompt, refs};
@@ -11,6 +12,126 @@ pub struct ReedlineInputBackend {
 }
 
 const COMPLETION_MENU_NAME: &str = "completion_menu";
+
+/// How many times `reedline.read_line()` is attempted before its error is
+/// propagated: the initial call plus this many minus one retries. See
+/// `read_line` below.
+const MAX_READ_LINE_ATTEMPTS: u32 = 3;
+
+struct HideEmptyCompletionMenu {
+    inner: reedline::ColumnarMenu,
+}
+
+impl HideEmptyCompletionMenu {
+    const fn new(inner: reedline::ColumnarMenu) -> Self {
+        Self { inner }
+    }
+
+    fn deactivate_if_settled_empty(&mut self) {
+        if self.inner.is_active()
+            && self.inner.get_values().is_empty()
+            && !self.inner.results_are_provisional()
+            && !self.inner.is_awaiting_first_answer()
+        {
+            self.inner.menu_event(reedline::MenuEvent::Deactivate);
+        }
+    }
+}
+
+impl reedline::Menu for HideEmptyCompletionMenu {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn indicator(&self) -> &str {
+        self.inner.indicator()
+    }
+
+    fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    fn set_active(&mut self, active: bool) {
+        self.inner.set_active(active);
+    }
+
+    fn clear_input(&mut self) {
+        self.inner.clear_input();
+    }
+
+    fn menu_event(&mut self, event: reedline::MenuEvent) {
+        self.inner.menu_event(event);
+    }
+
+    fn can_quick_complete(&self) -> bool {
+        self.inner.can_quick_complete()
+    }
+
+    fn can_partially_complete(
+        &mut self,
+        values_updated: bool,
+        editor: &mut reedline::Editor,
+        completer: &mut dyn reedline::Completer,
+    ) -> bool {
+        let completed = self
+            .inner
+            .can_partially_complete(values_updated, editor, completer);
+        self.deactivate_if_settled_empty();
+        completed
+    }
+
+    fn update_values(
+        &mut self,
+        editor: &mut reedline::Editor,
+        completer: &mut dyn reedline::Completer,
+    ) {
+        self.inner.update_values(editor, completer);
+        self.deactivate_if_settled_empty();
+    }
+
+    fn reset_position(&mut self) {
+        self.inner.reset_position();
+    }
+
+    fn update_working_details(
+        &mut self,
+        editor: &mut reedline::Editor,
+        completer: &mut dyn reedline::Completer,
+        painter: &reedline::Painter,
+    ) {
+        self.inner
+            .update_working_details(editor, completer, painter);
+        self.deactivate_if_settled_empty();
+    }
+
+    fn replace_in_buffer(&self, editor: &mut reedline::Editor) {
+        self.inner.replace_in_buffer(editor);
+    }
+
+    fn menu_required_lines(&self, terminal_columns: u16) -> u16 {
+        self.inner.menu_required_lines(terminal_columns)
+    }
+
+    fn menu_string(&self, available_lines: u16, use_ansi_coloring: bool) -> String {
+        self.inner.menu_string(available_lines, use_ansi_coloring)
+    }
+
+    fn min_rows(&self) -> u16 {
+        self.inner.min_rows()
+    }
+
+    fn get_values(&self) -> &[reedline::Suggestion] {
+        self.inner.get_values()
+    }
+
+    fn results_are_provisional(&self) -> bool {
+        self.inner.results_are_provisional()
+    }
+
+    fn is_awaiting_first_answer(&self) -> bool {
+        self.inner.is_awaiting_first_answer()
+    }
+}
 
 fn completion_menu_text_style() -> Style {
     Style::new()
@@ -65,14 +186,9 @@ impl ReedlineInputBackend {
             shell: shell_ref.clone(),
         };
 
-        // Set up completion menu. Set an empty marker to avoid the
-        // line's text horizontally shifting around during/after completion.
-        // We set a max column count of 10 to ensure it's larger than the
-        // hard-coded default (4 last we checked); if there's not enough
-        // horizontal space in the terminal to fit that many columns, given
-        // the actual text to be displayed, it will get effectively dereased
-        // anyhow.
-        let completion_menu = Box::new(
+        // Use no marker so completion does not shift the input line.
+        // Ten columns is an upper bound; terminal width reduces it as needed.
+        let completion_menu = Box::new(HideEmptyCompletionMenu::new(
             reedline::ColumnarMenu::default()
                 .with_name(COMPLETION_MENU_NAME)
                 .with_marker("")
@@ -81,7 +197,7 @@ impl ReedlineInputBackend {
                 .with_match_text_style(completion_menu_match_text_style())
                 .with_selected_text_style(completion_menu_selected_text_style())
                 .with_selected_match_text_style(completion_menu_selected_match_text_style()),
-        );
+        ));
 
         // Set up default history-based hinter.
         let mut hinter = reedline::DefaultHinter::default();
@@ -154,23 +270,49 @@ impl InputBackend for ReedlineInputBackend {
         _shell: &crate::ShellRef<impl brush_core::ShellExtensions>,
         prompt: InteractivePrompt,
     ) -> Result<ReadResult, ShellError> {
-        if let Some(reedline) = &mut self.reedline {
+        let Some(reedline) = &mut self.reedline else {
+            return Ok(ReadResult::Eof);
+        };
+
+        let mut attempt: u32 = 1;
+        loop {
             match reedline.read_line(&prompt) {
-                Ok(reedline::Signal::Success(s)) => {
-                    if edit_mode::is_reedline_host_command(s.as_str()) {
-                        Ok(ReadResult::BoundCommand(s))
-                    } else {
-                        Ok(ReadResult::Input(s))
-                    }
+                Ok(reedline::Signal::Success(s)) => return Ok(ReadResult::Input(s)),
+                Ok(reedline::Signal::CtrlC) => return Ok(ReadResult::Interrupted),
+                Ok(reedline::Signal::CtrlD) => return Ok(ReadResult::Eof),
+                Ok(reedline::Signal::ExternalBreak(_)) => {
+                    return Err(ShellError::UnexpectedInputFailure);
                 }
-                Ok(reedline::Signal::CtrlC) => Ok(ReadResult::Interrupted),
-                Ok(reedline::Signal::CtrlD) => Ok(ReadResult::Eof),
-                Ok(reedline::Signal::ExternalBreak(_)) => Err(ShellError::UnexpectedInputFailure),
-                Ok(_) => Err(ShellError::UnexpectedInputFailure),
-                Err(err) => Err(ShellError::InputError(err)),
+                Ok(reedline::Signal::HostCommand(cmd)) => return Ok(ReadResult::BoundCommand(cmd)),
+                Ok(_) => return Err(ShellError::UnexpectedInputFailure),
+                // An error here is almost always transient. The prevalent case:
+                // reedline asks the terminal for the cursor position (DSR,
+                // `ESC [ 6 n`) before painting a prompt, and again after an
+                // external program (a `bind -x` command such as atuin's search
+                // UI, fzf, ...) hands the terminal back. crossterm waits a fixed
+                // 2s for the reply and then fails; a terminal busy repainting or
+                // a multiplexer briefly holding the reply is enough to trip it,
+                // and giving up would end the whole interactive session. That
+                // failure happens before any input is read, so re-issuing the
+                // read is safe; retry a bounded number of times before treating
+                // the failure as real. A terminal that never answers therefore
+                // fails after MAX_READ_LINE_ATTEMPTS x 2s rather than 2s.
+                //
+                // The one known exception: reedline restores the terminal mode
+                // *after* computing its result, so if `disable_raw_mode` itself
+                // fails, a line that was already submitted is lost and the retry
+                // prompts afresh. That is a tcsetattr failure on a tty that just
+                // worked; the alternative -- exiting the shell -- loses the same
+                // line and everything else with it.
+                Err(err) if attempt < MAX_READ_LINE_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(
+                        target: trace_categories::INPUT,
+                        "reedline read_line failed; retrying (attempt {attempt}/{MAX_READ_LINE_ATTEMPTS}): {err}"
+                    );
+                }
+                Err(err) => return Err(ShellError::InputError(err)),
             }
-        } else {
-            Ok(ReadResult::Eof)
         }
     }
 
@@ -257,6 +399,92 @@ fn compose_key_bindings(completion_menu_name: &str) -> reedline::Keybindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StaticCompleter(reedline::CompletionResult);
+
+    impl reedline::Completer for StaticCompleter {
+        fn complete(&mut self, _line: &str, _pos: usize) -> reedline::CompletionResult {
+            self.0.clone()
+        }
+    }
+
+    fn active_completion_menu() -> HideEmptyCompletionMenu {
+        let mut menu = HideEmptyCompletionMenu::new(reedline::ColumnarMenu::default());
+        menu.menu_event(reedline::MenuEvent::Activate(true));
+        menu
+    }
+
+    fn update_menu(menu: &mut HideEmptyCompletionMenu, completer: &mut dyn reedline::Completer) {
+        let mut editor = reedline::Editor::default();
+        menu.update_values(&mut editor, completer);
+    }
+
+    #[test]
+    fn completion_menu_closes_for_empty_fresh_results() {
+        let mut menu = active_completion_menu();
+        let mut completer = StaticCompleter(reedline::CompletionResult::fresh(Vec::<
+            reedline::Suggestion,
+        >::new()));
+
+        update_menu(&mut menu, &mut completer);
+
+        assert!(!menu.is_active());
+    }
+
+    #[test]
+    fn completion_menu_stays_open_before_first_answer() {
+        let mut menu = active_completion_menu();
+
+        assert!(menu.is_awaiting_first_answer());
+        menu.deactivate_if_settled_empty();
+
+        assert!(menu.is_active());
+    }
+
+    #[test]
+    fn completion_menu_stays_open_for_fresh_results() {
+        let mut menu = active_completion_menu();
+        let mut completer = StaticCompleter(reedline::CompletionResult::fresh(vec![
+            reedline::Suggestion {
+                value: "candidate".into(),
+                description: None,
+                style: None,
+                extra: None,
+                span: reedline::Span::new(0, 0),
+                match_indices: None,
+                display_override: None,
+                append_whitespace: false,
+            },
+        ]));
+
+        update_menu(&mut menu, &mut completer);
+
+        assert!(menu.is_active());
+    }
+
+    #[test]
+    fn completion_menu_stays_open_while_results_are_pending() {
+        let mut menu = active_completion_menu();
+        let mut completer = StaticCompleter(reedline::CompletionResult::Pending);
+
+        update_menu(&mut menu, &mut completer);
+
+        assert!(menu.is_active());
+    }
+
+    #[test]
+    fn completion_menu_stays_open_while_results_are_stale() {
+        let mut menu = active_completion_menu();
+        let mut completer = StaticCompleter(reedline::CompletionResult::Stale {
+            suggestions: Vec::<reedline::Suggestion>::new().into(),
+            origin: reedline::CompletionOrigin::new("", 0),
+            partial: None,
+        });
+
+        update_menu(&mut menu, &mut completer);
+
+        assert!(menu.is_active());
+    }
 
     #[test]
     fn history_hint_style_is_theme_adaptive() {

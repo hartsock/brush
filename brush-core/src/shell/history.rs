@@ -15,8 +15,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         let mut options = std::fs::File::options();
         options.read(true);
 
-        let mut history_file =
-            self.open_file(&options, history_path, &self.default_exec_params())?;
+        let mut history_file = self.open_file(
+            &options,
+            crate::filter::FileOpenAccess::Read,
+            history_path,
+            &self.default_exec_params(),
+        )?;
 
         // Check on the file's size.
         if let openfiles::OpenFile::File(file) = &mut history_file {
@@ -36,12 +40,27 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             }
         }
 
-        Ok(Some(crate::history::History::import(history_file)?))
+        let mut history = crate::history::History::import(history_file)?;
+
+        // As bash does, stamp entries that carry no timestamp in the file with the load time.
+        let load_time = chrono::Utc::now();
+        let unstamped: Vec<_> = history
+            .iter()
+            .filter(|item| item.timestamp.is_none())
+            .map(|item| (item.id, item.clone()))
+            .collect();
+        for (id, mut item) in unstamped {
+            item.timestamp = Some(load_time);
+            history.update_by_id(id, item)?;
+        }
+
+        Ok(Some(history))
     }
 
     /// Returns the path to the history file used by the shell, if one is set.
     pub fn history_file_path(&self) -> Option<PathBuf> {
         self.env_str("HISTFILE")
+            .filter(|s| !s.is_empty())
             .map(|s| PathBuf::from(s.into_owned()))
     }
 

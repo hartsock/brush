@@ -55,11 +55,31 @@ pub use state::ShellState;
 /// * `SE` - The shell extensions implementation to use. These extensions are statically injected
 ///   into the shell at compile time to provide custom behavior. When unspecified, defaults to
 ///   `DefaultShellExtensions`, which provide standard behavior.
+///
+/// With `serde`, a shell is serializable only when its installed policy types
+/// are serializable. Snapshots retain those policies; snapshots lacking them
+/// are rejected rather than restoring permissive defaults.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    serde(bound(
+        serialize = "SE::CmdExecFilter: serde::Serialize, SE::SourceFilter: serde::Serialize, SE::FileOpenFilter: serde::Serialize",
+        deserialize = "SE::CmdExecFilter: serde::Deserialize<'de>, SE::SourceFilter: serde::Deserialize<'de>, SE::FileOpenFilter: serde::Deserialize<'de>"
+    ))
+)]
 pub struct Shell<SE: extensions::ShellExtensions = extensions::DefaultShellExtensions> {
     /// Injected error behavior.
     #[cfg_attr(feature = "serde", serde(skip, default = "default_error_formatter"))]
     error_formatter: SE::ErrorFormatter,
+
+    /// Command execution filter.
+    cmd_exec_filter: SE::CmdExecFilter,
+
+    /// Source filter.
+    source_filter: SE::SourceFilter,
+
+    /// File-open filter.
+    file_open_filter: SE::FileOpenFilter,
 
     /// Trap handler configuration for the shell.
     traps: crate::traps::TrapHandlerConfig,
@@ -151,6 +171,9 @@ impl<SE: extensions::ShellExtensions> Clone for Shell<SE> {
     fn clone(&self) -> Self {
         Self {
             error_formatter: self.error_formatter.clone(),
+            cmd_exec_filter: self.cmd_exec_filter.clone(),
+            source_filter: self.source_filter.clone(),
+            file_open_filter: self.file_open_filter.clone(),
             traps: self.traps.clone(),
             open_files: self.open_files.clone(),
             working_dir: self.working_dir.clone(),
@@ -214,6 +237,9 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         // Instantiate the shell with some defaults.
         let mut shell = Self {
             error_formatter: options.error_formatter,
+            cmd_exec_filter: options.cmd_exec_filter,
+            source_filter: options.source_filter,
+            file_open_filter: options.file_open_filter,
             open_files: openfiles::OpenFiles::new(),
             options: runtime_options,
             name: options.shell_name,
@@ -249,12 +275,10 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             shell.env.set_global(var_name, var_value)?;
         }
 
-        // Set up history, if relevant. Do NOT fail if we can't load history.
+        // Set up history, if relevant. The history file itself is loaded later, once startup
+        // files have run, since they may change HISTFILE.
         if shell.options.enable_command_history {
-            shell.history = shell
-                .load_history()
-                .unwrap_or_default()
-                .or_else(|| Some(crate::history::History::default()));
+            shell.history = Some(crate::history::History::default());
         }
 
         Ok(shell)
@@ -311,6 +335,36 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
             .set_global("_", crate::variables::ShellVariable::new(value));
     }
 
+    /// Captures the state the last command left behind; see [`SavedCommandStatus`].
+    pub fn save_command_status(&self) -> SavedCommandStatus {
+        SavedCommandStatus {
+            exit_status: self.last_exit_status,
+            exit_status_change_count: self.last_exit_status_change_count,
+            pipeline_statuses: self.last_pipeline_statuses.clone(),
+            last_arg: self.env_str("_").map(|value| value.into_owned()),
+        }
+    }
+
+    /// Reapplies a snapshot, exit-status change counter included. Consumes it; `clone` it to
+    /// put the same one back more than once, e.g. between successive hook functions.
+    ///
+    /// # Arguments
+    ///
+    /// * `saved` - The snapshot to restore.
+    pub fn restore_command_status(&mut self, saved: SavedCommandStatus) {
+        self.last_pipeline_statuses = saved.pipeline_statuses;
+        // Assigned directly rather than through `set_last_exit_status`, which would bump
+        // the change counter we're about to put back.
+        self.last_exit_status = saved.exit_status;
+        self.last_exit_status_change_count = saved.exit_status_change_count;
+        match saved.last_arg {
+            Some(last_arg) => self.update_last_arg_variable(Some(last_arg)),
+            // `_` was unset when the snapshot was taken, so put it back that way. Unsetting
+            // a readonly `_` fails; ignore that, as `update_last_arg_variable` does.
+            None => _ = self.env.unset("_"),
+        }
+    }
+
     /// Applies errexit semantics to a result if enabled and appropriate.
     /// This should be called at "statement boundaries" where errexit should be checked.
     ///
@@ -348,9 +402,37 @@ impl<SE: extensions::ShellExtensions> Shell<SE> {
         }
     }
 
+    /// Returns the command execution filter.
+    pub const fn cmd_exec_filter(&self) -> &SE::CmdExecFilter {
+        &self.cmd_exec_filter
+    }
+
+    /// Returns the source filter.
+    pub const fn source_filter(&self) -> &SE::SourceFilter {
+        &self.source_filter
+    }
+
+    /// Returns the file-open filter.
+    pub const fn file_open_filter(&self) -> &SE::FileOpenFilter {
+        &self.file_open_filter
+    }
+
     pub(crate) const fn last_exit_status_change_count(&self) -> usize {
         self.last_exit_status_change_count
     }
+}
+
+/// Snapshot of the state the last command left behind: `$?`, `PIPESTATUS`, and `$_`.
+///
+/// Take one with [`Shell::save_command_status`] and put it back with
+/// [`Shell::restore_command_status`] around anything the user didn't type -- a shell hook,
+/// `PROMPT_COMMAND`, prompt expansion -- so it stays invisible to the next command.
+#[derive(Clone, Debug)]
+pub struct SavedCommandStatus {
+    exit_status: u8,
+    exit_status_change_count: usize,
+    pipeline_statuses: Vec<u8>,
+    last_arg: Option<String>,
 }
 
 #[inherent::inherent]
@@ -513,8 +595,9 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
         self.last_exit_status
     }
 
-    /// Updates the last exit status. To *restore* a saved status, restore
-    /// `last_exit_status_change_count` as well.
+    /// Updates the last exit status, bumping `last_exit_status_change_count`. To *restore* a
+    /// status rather than set one, use [`Self::restore_command_status`], which puts the
+    /// counter back too.
     pub fn set_last_exit_status(&mut self, status: u8) {
         self.last_exit_status = status;
         self.last_exit_status_change_count += 1;
@@ -550,4 +633,60 @@ impl<SE: extensions::ShellExtensions> ShellState for Shell<SE> {
 #[cfg(feature = "serde")]
 fn default_error_formatter<EF: extensions::ErrorFormatter>() -> EF {
     EF::default()
+}
+
+#[cfg(test)]
+#[allow(clippy::panic_in_result_fn, reason = "assertions in a fallible test")]
+mod tests {
+    use super::*;
+
+    /// `$_` round-trips through a snapshot, unset included, so an embedder that saves before
+    /// running commands of its own gets back exactly what was there -- not an empty string.
+    /// (The interactive loop can't reach the unset case: every command resets `$_`.)
+    #[tokio::test]
+    async fn saved_command_status_round_trips_last_arg() -> Result<(), error::Error> {
+        let mut shell = Shell::builder()
+            .profile(ProfileLoadBehavior::Skip)
+            .rc(RcLoadBehavior::Skip)
+            .build()
+            .await?;
+
+        shell.update_last_arg_variable(Some(String::from("saved")));
+        let with_value = shell.save_command_status();
+
+        shell.env.unset("_")?;
+        let while_unset = shell.save_command_status();
+
+        shell.restore_command_status(with_value);
+        assert_eq!(shell.env_str("_").as_deref(), Some("saved"));
+
+        shell.restore_command_status(while_unset);
+        assert_eq!(shell.env_str("_"), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unset_env_str_contract_is_independent_of_ifs_default() -> Result<(), error::Error> {
+        let mut shell = Shell::builder()
+            .profile(ProfileLoadBehavior::Skip)
+            .rc(RcLoadBehavior::Skip)
+            .build()
+            .await?;
+
+        shell.env.set_global(
+            "IFS",
+            crate::ShellVariable::new(crate::ShellValue::Unset(
+                crate::variables::ShellValueUnsetType::Untyped,
+            )),
+        )?;
+        assert_eq!(shell.env_str("IFS").as_deref(), Some(""));
+        assert_eq!(shell.ifs(), " \t\n");
+
+        shell.env.set_global("IFS", crate::ShellVariable::new(""))?;
+        assert_eq!(shell.env_str("IFS").as_deref(), Some(""));
+        assert_eq!(shell.ifs(), "");
+
+        Ok(())
+    }
 }

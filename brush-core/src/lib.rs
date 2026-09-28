@@ -13,6 +13,7 @@ pub mod escape;
 pub mod expansion;
 mod extendedtests;
 pub mod extensions;
+pub mod filter;
 pub mod functions;
 pub mod history;
 pub mod int_utils;
@@ -57,8 +58,8 @@ pub use interp::{ExecutionParameters, ProcessGroupPolicy};
 pub use parser::{SourcePosition, SourcePositionOffset, SourceSpan};
 pub use results::{ExecutionControlFlow, ExecutionExitCode, ExecutionResult, ExecutionSpawnResult};
 pub use shell::{
-    CreateOptions, ProfileLoadBehavior, RcLoadBehavior, Shell, ShellBuilder, ShellBuilderState,
-    ShellFd, ShellState,
+    CreateOptions, ProfileLoadBehavior, RcLoadBehavior, SavedCommandStatus, Shell, ShellBuilder,
+    ShellBuilderState, ShellFd, ShellState,
 };
 pub use sourceinfo::SourceInfo;
 pub use variables::{ShellValue, ShellVariable};

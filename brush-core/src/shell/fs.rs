@@ -7,8 +7,10 @@ use normalize_path::NormalizePath as _;
 use crate::{
     ExecutionParameters, ShellFd,
     env::{EnvironmentLookup, EnvironmentScope},
-    error, openfiles, pathsearch,
-    sys::{fs::PathExt as _, users},
+    error,
+    filter::{FileOpenAccess, FileOpenFilter as _, FileOpenParams},
+    openfiles, pathsearch,
+    sys::users,
     variables,
 };
 
@@ -81,11 +83,12 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         }
     }
 
-    /// Finds executables in the shell's current default PATH, matching the given glob pattern.
+    /// Finds executables with the given name in the shell's current PATH, yielding each match
+    /// in search order.
     ///
     /// # Arguments
     ///
-    /// * `required_glob_pattern` - The glob pattern to match against.
+    /// * `filename` - The name of the executable to look for.
     pub fn find_executables_in_path<'a>(
         &'a self,
         filename: &'a str,
@@ -123,14 +126,8 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         &self,
         candidate_name: S,
     ) -> Option<PathBuf> {
-        let path = self.env_str("PATH").unwrap_or_default();
-        for one_dir in crate::sys::fs::split_paths(path.as_ref()) {
-            let candidate_path = one_dir.join(candidate_name.as_ref());
-            if candidate_path.executable() {
-                return Some(candidate_path);
-            }
-        }
-        None
+        self.find_executables_in_path(candidate_name.as_ref())
+            .next()
     }
 
     /// Uses the shell's hash-based path cache to check whether the given filename is the name
@@ -158,6 +155,45 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         }
     }
 
+    /// Resolves a command name by searching the shell's current PATH.
+    ///
+    /// Unlike [`Self::find_first_executable_in_path`], a non-executable entry in the PATH
+    /// resolves as the command; the shell reports it as the command and then fails to run it.
+    /// See [`pathsearch::resolve_command`].
+    ///
+    /// # Arguments
+    ///
+    /// * `candidate_name` - The name of the command to resolve.
+    pub fn resolve_command_in_path<S: AsRef<str>>(&self, candidate_name: S) -> Option<PathBuf> {
+        let path_var = self.env.get_str("PATH", self).unwrap_or_default();
+        let paths = crate::sys::fs::split_paths(path_var.as_ref());
+        pathsearch::resolve_command(paths, candidate_name.as_ref())
+    }
+
+    /// Like [`Self::resolve_command_in_path`], but consults the shell's hash-based path cache
+    /// first and caches whatever a search turns up.
+    ///
+    /// # Arguments
+    ///
+    /// * `candidate_name` - The name of the command to resolve.
+    pub fn resolve_command_in_path_using_cache<S: AsRef<str>>(
+        &mut self,
+        candidate_name: S,
+    ) -> Option<PathBuf>
+    where
+        String: From<S>,
+    {
+        if let Some(cached_path) = self.program_location_cache.get(&candidate_name) {
+            return Some(cached_path);
+        }
+
+        let found_path = self.resolve_command_in_path(candidate_name.as_ref())?;
+        self.program_location_cache
+            .set(candidate_name, found_path.clone());
+
+        Some(found_path)
+    }
+
     /// Gets the absolute form of the given path.
     ///
     /// # Arguments
@@ -177,28 +213,39 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
     /// # Arguments
     ///
     /// * `options` - The options to use opening the file.
+    /// * `access` - Typed access matching the requested options.
     /// * `path` - The path to the file to open; may be relative to the shell's working directory.
     /// * `params` - Execution parameters.
     pub(crate) fn open_file(
         &self,
         options: &std::fs::OpenOptions,
+        access: FileOpenAccess,
         path: impl AsRef<Path>,
         params: &ExecutionParameters,
-    ) -> Result<openfiles::OpenFile, std::io::Error> {
+    ) -> Result<openfiles::OpenFile, error::Error> {
+        let path = path.as_ref();
+        let path_to_open = self.absolute_path(path);
+        self.file_open_filter().pre_open_file(FileOpenParams::new(
+            self,
+            path,
+            &path_to_open,
+            access,
+        ))?;
+
         // Give platform-specific code a chance to handle special files
         // (e.g. /dev/null on Windows, which needs to open NUL instead).
-        // This is checked before absolute_path so that paths like /dev/null
-        // are intercepted on platforms where they aren't valid native paths.
-        if let Some(result) = crate::sys::fs::try_open_special_file(path.as_ref()) {
-            return result.map(openfiles::OpenFile::from);
+        // Windows needs the resolved drive-qualified path here: `/dev/null`
+        // alone is rooted but not absolute there. Policy has already seen both
+        // the original spelling and this resolved path before any special open.
+        if let Some(result) = crate::sys::fs::try_open_special_file(&path_to_open) {
+            return result.map(openfiles::OpenFile::from).map_err(Into::into);
         }
-
-        let path_to_open = self.absolute_path(path.as_ref());
 
         // See if this is a reference to a file descriptor. These paths should
         // reflect the shell's current execution fds, which can differ from the
         // host process fds after redirections like here-docs.
-        if let Some(fd_num) = shell_fd_path_to_fd(&path_to_open)
+        if let Some(fd_num) =
+            shell_fd_path_to_fd(path).or_else(|| shell_fd_path_to_fd(&path_to_open))
             && let Some(open_file) = params.try_fd(self, fd_num)
         {
             return Ok(open_file);
