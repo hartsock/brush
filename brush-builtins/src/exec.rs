@@ -1,7 +1,11 @@
 use clap::Parser;
 use std::{borrow::Cow, os::unix::process::CommandExt};
 
-use brush_core::{ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands};
+use brush_core::{
+    ErrorKind, ExecutionExitCode, ExecutionResult, builtins, commands,
+    filter::{CmdExecFilter as _, PreFilterResult, SimpleCmdParams},
+    results::ExecutionWaitResult,
+};
 
 /// Exec the provided command.
 #[derive(Parser)]
@@ -62,6 +66,30 @@ impl builtins::Command for ExecCommand {
 
         if self.exec_as_login {
             argv0 = Cow::Owned(std::format!("-{argv0}"));
+        }
+
+        // `exec` replaces the process image and never reaches external dispatch, so consult the
+        // command filter here, showing it the resolved program that will actually run.
+        let resolved = commands::resolve_external_program(context.shell, &self.args[0]);
+        let program = resolved
+            .as_deref()
+            .map_or(Cow::Borrowed(self.args[0].as_str()), |p| {
+                p.to_string_lossy()
+            });
+        let filter = context.shell.cmd_exec_filter().clone();
+        let params = SimpleCmdParams::new(context.shell, program, &self.args[1..]);
+        match filter.pre_simple_cmd(params).await {
+            PreFilterResult::Continue(_) => {}
+            PreFilterResult::Return(output) => {
+                return match output?.wait().await? {
+                    ExecutionWaitResult::Completed(result) => Ok(result),
+                    ExecutionWaitResult::Stopped(_) => {
+                        brush_core::error::unimp("filter returned a stopped process to exec")
+                    }
+                };
+            }
+            // Fail closed: about to replace the process image.
+            _ => return brush_core::error::unimp("unrecognized filter result for exec"),
         }
 
         let mut cmd = commands::compose_std_command(
